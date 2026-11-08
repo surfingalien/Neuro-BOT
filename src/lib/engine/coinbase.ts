@@ -14,10 +14,45 @@ const num = (v: string | undefined, d: number) => {
   return isFinite(n) && n > 0 ? n : d;
 };
 
-const keyName = () => (process.env.COINBASE_API_KEY_NAME ?? "").trim();
-const privateKey = () => (process.env.COINBASE_API_PRIVATE_KEY ?? "").replace(/\\n/g, "\n").trim();
+const keyName = () => (process.env.COINBASE_API_KEY_NAME ?? "").trim().replace(/^["']|["']$/g, "");
+const rawPrivateKey = () => process.env.COINBASE_API_PRIVATE_KEY ?? "";
 
-export const cbConfigured = () => keyName().length > 0 && privateKey().length > 0;
+/**
+ * Hosts mangle multi-line secrets in different ways: wrapping quotes, literal "\n",
+ * newlines flattened to spaces, CRLF. Pull out the base64 body and rebuild a clean PEM.
+ */
+export function normalizePem(raw: string): string {
+  let t = raw.trim().replace(/^["']|["']$/g, "").replace(/\\r/g, "").replace(/\\n/g, "\n").replace(/\r/g, "");
+  const m = t.match(/-----BEGIN ([A-Z ]+)-----([\s\S]*?)-----END \1-----/);
+  const label = m ? m[1] : "EC PRIVATE KEY";
+  const body = (m ? m[2] : t.replace(/-----[A-Z ]+-----/g, "")).replace(/\s+/g, "");
+  return `-----BEGIN ${label}-----\n${(body.match(/.{1,64}/g) ?? []).join("\n")}\n-----END ${label}-----\n`;
+}
+
+let keyCache: { raw: string; key: crypto.KeyObject } | null = null;
+function privateKeyObject(): crypto.KeyObject {
+  const raw = rawPrivateKey();
+  if (keyCache && keyCache.raw === raw) return keyCache.key;
+  const pem = normalizePem(raw);
+  const labels = ["EC PRIVATE KEY", "PRIVATE KEY"]; // CDP keys are SEC1 (EC); also accept PKCS#8
+  let lastErr = "";
+  for (const label of labels) {
+    const body = pem.replace(/-----[A-Z ]+-----/g, "").trim();
+    const candidate = pem.includes(`BEGIN ${label}`) ? pem : `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`;
+    try {
+      const key = crypto.createPrivateKey(candidate);
+      keyCache = { raw, key };
+      return key;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : "unknown";
+    }
+  }
+  throw new CbError(
+    `COINBASE_API_PRIVATE_KEY could not be read (${lastErr.split(":").pop()?.trim()}). Paste the whole key from the downloaded file, including the BEGIN/END lines.`
+  );
+}
+
+export const cbConfigured = () => keyName().length > 0 && rawPrivateKey().trim().length > 0;
 
 /** every condition that must hold before a single real order can be placed */
 export function liveGate(): { ok: boolean; problems: string[] } {
@@ -43,7 +78,7 @@ function makeJwt(method: string, path: string): string {
   const header = { alg: "ES256", kid: name, nonce: crypto.randomBytes(16).toString("hex"), typ: "JWT" };
   const payload = { sub: name, iss: "cdp", nbf: now, exp: now + 120, uri: `${method} ${HOST}${path}` };
   const data = `${b64u(JSON.stringify(header))}.${b64u(JSON.stringify(payload))}`;
-  const sig = crypto.sign("sha256", Buffer.from(data), { key: privateKey(), dsaEncoding: "ieee-p1363" });
+  const sig = crypto.sign("sha256", Buffer.from(data), { key: privateKeyObject(), dsaEncoding: "ieee-p1363" });
   return `${data}.${b64u(sig)}`;
 }
 

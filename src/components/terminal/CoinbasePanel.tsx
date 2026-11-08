@@ -62,7 +62,7 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
   const locked = info?.live.entriesLocked;
 
   return (
-    <section className="nb-panel flex flex-col">
+    <section id="coinbase" className="nb-panel flex flex-col scroll-mt-4">
       <div className="nb-panel-head">
         <span>coinbase · balance &amp; holdings</span>
         <span
