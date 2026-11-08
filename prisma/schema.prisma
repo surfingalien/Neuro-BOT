@@ -15,6 +15,7 @@ model Setting {
   marketFocus      String   @default("both") // majors | memecoins | both
   startBalance     Float    @default(1000)
   balance          Float    @default(1000)
+  paperBalance     Float    @default(1000)  // paper balance parked while mode = live
   maxPositionPct   Float    @default(8)
   stopLossPct      Float    @default(8)
   tp1Pct           Float    @default(8)
@@ -72,6 +73,8 @@ model Trade {
   realizedPnl   Float    @default(0)
   pnlPct        Float    @default(0)
   featuresJson  String   @default("{}") // analyst sub-scores snapshot
+  mode          String   @default("paper") // paper | live (real Coinbase order)
+  heldQty       Float    @default(0)       // live: coins actually still held (after TP1 partial sell)
   openedAt      DateTime @default(now())
   closedAt      DateTime?
 }

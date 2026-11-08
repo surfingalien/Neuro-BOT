@@ -5,7 +5,8 @@ import type { MarketFocus } from "@/lib/engine/types";
 export const dynamic = "force-dynamic";
 
 interface ControlBody {
-  action: "start" | "pause" | "reset" | "forceScan" | "focus" | "closePosition";
+  action: "start" | "pause" | "reset" | "forceScan" | "focus" | "closePosition" | "liveOn" | "liveOff";
+  confirm?: string;
   focus?: MarketFocus;
   positionId?: string;
 }
@@ -40,6 +41,16 @@ export async function POST(req: Request) {
     case "closePosition": {
       const pos = engine.positions.find((p) => p.id === body.positionId);
       if (pos) await engine.closePosition(pos, pos.price, "manual");
+      break;
+    }
+    case "liveOn": {
+      const r = await engine.enableLive(typeof body.confirm === "string" ? body.confirm : "");
+      if (!r.ok) return NextResponse.json({ error: r.error }, { status: 400 });
+      break;
+    }
+    case "liveOff": {
+      const r = await engine.disableLive();
+      if (!r.ok) return NextResponse.json({ error: r.error }, { status: 409 });
       break;
     }
     default:

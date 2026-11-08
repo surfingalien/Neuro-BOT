@@ -63,8 +63,6 @@ export default function SettingsDialog({ open, onOpenChange, snap, onSaved }: Pr
     startBalance: Number(s.startBalance ?? 1000),
   });
   const [closeOnTarget, setCloseOnTarget] = useState<boolean>(s.closeOnTarget !== false);
-  const [apiKey, setApiKey] = useState("");
-  const [apiSecret, setApiSecret] = useState("");
   const [tgToken, setTgToken] = useState("");
   const [tgChatId, setTgChatId] = useState("");
   const [tgEnabled, setTgEnabled] = useState<boolean>(snap.tg.enabled);
@@ -84,8 +82,6 @@ export default function SettingsDialog({ open, onOpenChange, snap, onSaved }: Pr
         body: JSON.stringify({
           ...form,
           closeOnTarget,
-          binanceKey: apiKey || undefined,
-          binanceSecret: apiSecret || undefined,
           tgToken: tgToken || undefined,
           tgChatId: tgChatId || undefined,
           tgEnabled,
@@ -242,33 +238,11 @@ export default function SettingsDialog({ open, onOpenChange, snap, onSaved }: Pr
         </div>
 
         <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-3">
-          <div className="flex items-center justify-between">
-            <span className="text-[10.5px] tracking-wider text-slate-300 uppercase">live trading · binance keys</span>
-            <span className="text-[9px] border border-amber-500/40 text-amber-300 rounded-full px-2 py-0.5">
-              OFF in sandbox
-            </span>
-          </div>
+          <span className="text-[10.5px] tracking-wider text-slate-300 uppercase">live trading · coinbase</span>
           <p className="mt-1 text-[9.5px] text-slate-500 leading-snug">
-            paper mode trades real prices with fake money. to go live later: paste API keys here (stored encrypted, never
-            echoed back), flip mode to live and enable withdrawals-off trade-only keys. live execution stays disabled in
-            this build until you host it with your own keys.
+            API keys are never entered here. Set COINBASE_API_KEY_NAME, COINBASE_API_PRIVATE_KEY, LIVE_TRADING_ENABLED and
+            APP_PASSWORD in your host&apos;s environment variables, then use the Coinbase panel on the dashboard.
           </p>
-          <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <input
-              type="password"
-              placeholder="BINANCE API KEY"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              className="bg-slate-900/80 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-violet-500/60"
-            />
-            <input
-              type="password"
-              placeholder="BINANCE API SECRET"
-              value={apiSecret}
-              onChange={(e) => setApiSecret(e.target.value)}
-              className="bg-slate-900/80 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-violet-500/60"
-            />
-          </div>
         </div>
 
         <div className="flex items-center justify-between gap-3">

@@ -67,17 +67,22 @@ function memeRules(p: ScoutPair): FilterRuleResult[] {
 }
 
 function majorRules(p: ScoutPair): FilterRuleResult[] {
-  const volOk = p.volume24h >= 50_000_000;
+  // Coinbase USD books are ~50x thinner than Binance USDT, so the bar scales by source
+  const cb = p.source === "coinbase";
+  const minVol = cb ? 1_000_000 : 50_000_000;
+  const minLiq = cb ? 400_000 : 20_000_000;
+  const minTx = cb ? 100 : 5_000;
+  const volOk = p.volume24h >= minVol;
   const pump = p.change24h;
   return [
-    { label: "spot pair on Binance", pass: true, value: "verified", na: true },
-    { label: "24h volume ≥ $50M", pass: volOk, value: fmtUsd(p.volume24h) },
-    { label: "deep book (liq ≥ $20M)", pass: p.liquidity >= 20_000_000, value: fmtUsd(p.liquidity) },
+    { label: cb ? "spot pair on Coinbase" : "spot pair on Binance", pass: true, value: "verified", na: true },
+    { label: `24h volume ≥ ${fmtUsd(minVol)}`, pass: volOk, value: fmtUsd(p.volume24h) },
+    { label: `deep book (liq ≥ ${fmtUsd(minLiq)})`, pass: p.liquidity >= minLiq, value: fmtUsd(p.liquidity) },
     { label: "no delisting flag", pass: true, value: "clean", na: true },
     { label: "taker flow not bleeding", pass: true, value: `${p.buys1h > p.sells1h ? "+" : ""}${((p.buys1h / Math.max(1, p.sells1h)) - 1).toFixed(2)}` },
     { label: "24h range sane ≤ 15%", pass: Math.abs(pump) <= 15, value: `${pump > 0 ? "+" : ""}${pump.toFixed(1)}%` },
-    { label: "quote asset USDT", pass: true, value: "USDT", na: true },
-    { label: "1h txns ≥ 5k", pass: p.txns1h >= 5_000, value: `${p.txns1h.toLocaleString()} txns` },
+    { label: `quote asset ${cb ? "USD" : "USDT"}`, pass: true, value: cb ? "USD" : "USDT", na: true },
+    { label: `1h txns ≥ ${cb ? minTx : "5k"}`, pass: p.txns1h >= minTx, value: `${p.txns1h.toLocaleString()} txns` },
   ];
 }
 

@@ -12,6 +12,7 @@ import BrainPanel from "@/components/terminal/BrainPanel";
 import TargetPanel from "@/components/terminal/TargetPanel";
 import StatsPanel from "@/components/terminal/StatsPanel";
 import LogPanel from "@/components/terminal/LogPanel";
+import CoinbasePanel from "@/components/terminal/CoinbasePanel";
 import SettingsDialog from "@/components/terminal/SettingsDialog";
 import BacktestDialog from "@/components/terminal/BacktestDialog";
 
@@ -152,6 +153,7 @@ export default function Home() {
               <AnalystPanel snap={snap} />
             </div>
             <PositionPanel snap={snap} />
+            <CoinbasePanel snap={snap} onChanged={() => void poll()} />
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
               <BrainPanel snap={snap} />
               <div className="flex flex-col gap-4 min-h-0">
@@ -167,8 +169,8 @@ export default function Home() {
 
         {/* footer */}
         <footer className="mt-2 text-center text-[9.5px] text-slate-600 leading-relaxed">
-          one result · not typical · crypto is extremely high risk and you can lose everything · paper trading fills
-          real prices with fake money · nothing here is financial advice
+          one result · not typical · crypto is extremely high risk and you can lose everything · paper mode fills
+          real prices with fake money; live mode places real Coinbase orders · nothing here is financial advice
           <br />
           neuro-bot terminal · six agents · target manager · self-improving brain · built for research
         </footer>

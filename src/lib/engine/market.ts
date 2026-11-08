@@ -1,8 +1,9 @@
-// ─── Market data: Binance (majors) + DexScreener (Solana memecoins) ───
+// ─── Market data: Coinbase → Binance → sim (majors) + DexScreener (Solana memecoins) ───
 // All public endpoints, no keys required. Falls back to a clearly-labeled
 // synthetic feed if the sandbox has no outbound access.
 
 import type { Candle, Klines, MarketKind, ScoutPair } from "./types";
+import { cbCandles, cbProducts, toProductId } from "./coinbase";
 
 export const MAJOR_SYMBOLS = [
   "BTCUSDT",
@@ -80,6 +81,12 @@ export async function fetchMajors(): Promise<{
   live: boolean;
 }> {
   const now = Date.now();
+  const cb = await coinbaseMajors();
+  if (cb.length >= 5) {
+    memo.__nbLiveOk = true;
+    return { rows: cb, live: true };
+  }
+
   const cached = memo.__nbTickerCache;
   if (cached && now - cached.at < 12_000) {
     return { rows: majorsFromTicker(cached.data), live: memo.__nbLiveOk !== false };
@@ -112,6 +119,40 @@ export async function fetchMajors(): Promise<{
   }
   memo.__nbLiveOk = false;
   return { rows: simMajors(now), live: false };
+}
+
+/** Coinbase spot (USD) — public endpoint, no key. Majors Coinbase doesn't list are skipped. */
+async function coinbaseMajors(): Promise<ScoutPair[]> {
+  try {
+    const prods = await cbProducts(MAJOR_SYMBOLS.map(toProductId));
+    const bySym = new Map(prods.filter((p) => p.tradable).map((p) => [p.id, p]));
+    const rows: ScoutPair[] = [];
+    for (const s of MAJOR_SYMBOLS) {
+      const d = bySym.get(toProductId(s));
+      if (!d) continue;
+      const qv = d.quoteVolume24h;
+      rows.push({
+        symbol: s,
+        base: s.replace("USDT", ""),
+        name: MAJOR_NAMES[s] ?? s,
+        market: "majors" as const,
+        price: d.price,
+        change24h: d.change24h,
+        volume24h: qv,
+        volume1h: qv / 24,
+        liquidity: qv * 0.4,
+        mcap: d.price * 1e12,
+        ageHours: 99999,
+        txns1h: Math.round(qv / 8000),
+        buys1h: Math.round(qv / 16000),
+        sells1h: Math.round(qv / 16000),
+        source: "coinbase",
+      });
+    }
+    return rows;
+  } catch {
+    return [];
+  }
 }
 
 function majorsFromTicker(map: Record<string, { price: number; change: number; qv: number }>): ScoutPair[] {
@@ -307,6 +348,15 @@ export async function fetchKlines(symbol: string, market: MarketKind): Promise<K
 
   const empty: Klines = { m1: [], h1: [], simulated: true };
   if (market === "majors") {
+    try {
+      const id = toProductId(symbol);
+      const [cm1, ch1] = await Promise.all([cbCandles(id, "ONE_MINUTE", 120), cbCandles(id, "ONE_HOUR", 60)]);
+      if (cm1.length > 30) {
+        const k: Klines = { m1: cm1, h1: ch1, simulated: false };
+        klineCache.set(symbol, { data: k, at: now });
+        return k;
+      }
+    } catch { /* fall back to binance → sim */ }
     const m1 = await binanceKlines(symbol, "1m", 120);
     const h1 = await binanceKlines(symbol, "1h", 60);
     if (m1.length > 30) {

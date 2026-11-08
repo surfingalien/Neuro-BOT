@@ -4,8 +4,9 @@ An autonomous crypto paper-trading bot with a 6-agent pipeline, a target manager
 that books profit/loss against daily AND weekly targets, Telegram alerts, and a
 backtest mode that trains the AI Brain on historical candles in seconds.
 
-> Paper trading only by default: real market prices, fake money. Live execution
-> is intentionally disabled in this build. Nothing here is financial advice.
+> Paper trading by default: real Coinbase prices, fake money. Live trading on
+> Coinbase is available but locked behind several gates (see "Coinbase" below).
+> Nothing here is financial advice.
 
 ---
 
@@ -48,15 +49,53 @@ The repo ships a `Dockerfile` + `railway.json`; Railway builds it automatically.
 3. Settings → Networking → Generate Domain. No port needed: the app listens on
    `$PORT` and binds `0.0.0.0` (binding the container hostname is what causes
    "Application failed to respond").
-4. Optional env: `DATABASE_URL` (defaults to `file:/data/custom.db`).
+4. Set `APP_PASSWORD` (dashboard login). Optional: `DATABASE_URL` (defaults to `file:/data/custom.db`). For Coinbase see the section above.
 
 The container runs `prisma db push` on boot, so the schema is created/synced
 automatically. The engine is a long-lived in-process loop with SQLite, so run a
 **single instance** (no horizontal scaling) and use a host with a persistent
 process, not serverless.
 
-> The control panel has no login. Anyone with the URL can pause/reset the bot or
-> change Telegram settings, so keep the URL private or put it behind an auth proxy.
+> Without `APP_PASSWORD` the control panel has no login: anyone with the URL can
+> pause/reset the bot or change Telegram settings. Set it.
+
+## Coinbase
+
+**Market data** comes from Coinbase Advanced Trade's public API (no key needed),
+with Binance and then a labelled simulation as fallbacks.
+
+**Balance, holdings and live trading** use a Coinbase CDP API key, set as
+environment variables on your host (never typed into the UI, never stored in the DB):
+
+| Variable | Purpose |
+|---|---|
+| `COINBASE_API_KEY_NAME` | `organizations/{org_id}/apiKeys/{key_id}` |
+| `COINBASE_API_PRIVATE_KEY` | the EC private key PEM (multi-line, or with `\n` escapes) |
+| `LIVE_TRADING_ENABLED` | must be `true` before live mode can be switched on |
+| `APP_PASSWORD` | dashboard login (HTTP Basic, any username). **Required for live trading** |
+| `LIVE_BANKROLL_USD` | most the bot will ever manage (default `100`) |
+| `LIVE_MAX_ORDER_USD` | hard cap per buy order (default `25`) |
+
+Create the key at the Coinbase Developer Platform with **View + Trade** permissions
+only (never Transfer/withdraw).
+
+How live mode is fenced in:
+
+- All gates above are re-checked server-side when you press GO LIVE, and you must type `ENABLE LIVE`.
+- Live trades **Coinbase-listed majors only**, priced only from the real Coinbase feed (never simulated data).
+- The bot's bankroll is `min(USD available, LIVE_BANKROLL_USD)`; each buy is capped by `LIVE_MAX_ORDER_USD`.
+- The existing daily/weekly targets and loss-cap breakers apply to the live bankroll and sell real positions.
+- Restarts always come back in paper mode. If live positions were still open, their exits keep being managed, but new entries stay locked until you re-confirm.
+- Pausing stops new entries only; open live positions keep their stops and targets.
+- If a sell fails the position stays open, is retried every 30s, and a Telegram alert fires (if enabled).
+- `SELL ALL & GO PAPER` sells every live position and returns to the paper book. Reset is refused in live mode.
+
+Know the limits: stops and targets are checked by this app every ~3s (they are not
+resting orders on Coinbase), so if the app is down nothing is watching your positions.
+Orders are market orders and pay Coinbase taker fees (all P&L is net of real fees).
+The strategy is experimental; it can and will lose money. Start with a bankroll you can lose.
+
+---
 
 ## What's inside
 
@@ -64,7 +103,7 @@ process, not serverless.
 
 | Agent      | Job                                                                 |
 |------------|---------------------------------------------------------------------|
-| SCOUT      | Binance 10 majors + DexScreener Solana memecoins (synthetic fallback) |
+| SCOUT      | Coinbase 10 majors + DexScreener Solana memecoins (synthetic fallback) |
 | FILTER     | 8 hard rules, one fail = killed (liquidity, bundlers, age, …)        |
 | ANALYST    | 6 sub-scores → 0-100 weighted by the Brain's learned signal weights  |
 | EXECUTOR   | softmax strategy pick (momentum / meanrev / breakout), ATR sizing    |
@@ -132,9 +171,10 @@ token/chat id are stored server-side and never echoed to any client.
 | Route            | Method | Purpose                                                    |
 |------------------|--------|------------------------------------------------------------|
 | `/api/state`     | GET    | full bot snapshot (agents, targets, brain, logs, tg)       |
-| `/api/control`   | POST   | `start` `pause` `reset` `forceScan` `focus` `closePosition`|
+| `/api/control`   | POST   | `start` `pause` `reset` `forceScan` `focus` `closePosition` `liveOn` `liveOff`|
 | `/api/settings`  | GET/POST | risk + targets + telegram config (token never echoed)    |
 | `/api/trades`    | GET    | closed trade history                                       |
+| `/api/coinbase`  | GET    | real Coinbase balance + holdings, live-mode gate status    |
 | `/api/backtest`  | GET/POST | GET last report · POST `{action:"run"|"apply", scope, bars, useLiveBrain}` |
 
 ## Layout
@@ -159,8 +199,9 @@ src/components/terminal/…     HeaderBar, FlowPipeline, FilterPanel, AnalystPan
 
 ## Notes & limits
 
-- Live exchange execution is disabled; paper mode fills real prices with fake
-  money and includes realistic slippage (0.04% majors / 0.4% memecoins).
+- Paper mode fills real prices with fake money and includes realistic slippage
+  (0.04% majors / 0.4% memecoins). Memecoins (DexScreener/Solana) are paper-only:
+  they can't be traded on Coinbase.
 - Memecoin OHLC is synthesized around live DexScreener quotes (DexScreener has
   no free candle API); the UI marks simulated data everywhere it appears.
 - The sandbox this was built in has no outbound Telegram access — SEND TEST
