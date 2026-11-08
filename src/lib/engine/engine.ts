@@ -11,6 +11,7 @@ import {
   stratParams,
   type BrainCore,
 } from "./brain";
+import { cbAccounts, cbMarketOrder, cbConfigured, cbProducts, liveGate, liveLimits, toProductId } from "./coinbase";
 import { dataSourceBadge, fetchKlines, fetchMajors, fetchMemecoins } from "./market";
 import { computeTargets, runAnalyst, runFilter } from "./rules";
 import { checkEntrySignal, pickStrategy } from "./strategies";
@@ -30,7 +31,7 @@ import { TG_DEFAULT_EVENTS, tgConfigure, tgConfig, tgEnabledFor, tgNotify, type 
 import type { BrainView } from "./backtest";
 
 const TICK_MS = 3000;
-const ENGINE_VERSION = 9; // bump to force engine rebuild on code change (dev HMR)
+const ENGINE_VERSION = 10; // bump to force engine rebuild on code change (dev HMR)
 
 interface Settings {
   mode: "paper" | "live";
@@ -105,6 +106,11 @@ class Engine {
   weekTargetHit = false;
   weekHalted = false;
   tgEvents: TgEventsConfig = { ...TG_DEFAULT_EVENTS };
+  // ── live trading (real Coinbase orders) ──
+  paperBalance = 1000; // paper balance parked while mode = live
+  paperStartBalance = 1000;
+  liveEntriesLocked = false; // booted into live with open positions: manage exits, no new entries until re-confirmed
+  sellBackoff = new Map<string, number>(); // position id → earliest next sell attempt
 
   regime: Regime = "ranging";
   volatility: VolState = "normal";
@@ -143,11 +149,11 @@ class Engine {
     try {
       const s = await db.setting.upsert({ where: { id: "main" }, update: {}, create: { id: "main" } });
       this.settings = {
-        mode: s.mode === "live" ? "paper" : "paper", // live gated in UI; force paper boot
+        mode: "paper", // always boot paper; live resumes only to manage still-open live positions
         running: s.running,
         marketFocus: (["majors", "memecoins", "both"].includes(s.marketFocus) ? s.marketFocus : "both") as MarketFocus,
         startBalance: s.startBalance,
-        balance: s.balance,
+        balance: s.mode === "live" ? s.paperBalance : s.balance, // live is only resumed below if live positions are still open
         maxPositionPct: s.maxPositionPct,
         stopLossPct: s.stopLossPct,
         tp1Pct: s.tp1Pct,
@@ -177,6 +183,8 @@ class Engine {
       // target manager: restore day/week bookkeeping (rollover if stale)
       this.dayKey = s.dayKey;
       this.dayPnl = s.dayPnl;
+      this.paperBalance = s.paperBalance;
+      this.paperStartBalance = s.mode === "live" ? s.paperBalance : s.startBalance;
       this.dayStartBalance = s.dayStartBalance || s.balance;
       this.weekKey = s.weekKey;
       this.weekPnl = s.weekPnl;
@@ -243,7 +251,21 @@ class Engine {
           tp1Booked: t.realizedPnl !== 0,
           entryScores: restoreEntryScores(t.featuresJson),
           source: "restored",
+          ...(t.mode === "live"
+            ? { live: true, heldQty: t.heldQty > 0 ? t.heldQty : t.qty, bankedPnl: t.realizedPnl }
+            : {}),
         });
+      }
+      if (this.positions.some((p) => p.live)) {
+        // real coins are still held: keep managing their stops/targets, but no new entries until the operator re-confirms
+        this.settings.mode = "live";
+        this.settings.balance = s.balance;
+        this.settings.startBalance = s.startBalance;
+        this.liveEntriesLocked = true;
+        this.log("RISK", `restart with ${this.positions.filter((p) => p.live).length} LIVE position(s) still open · managing exits, new entries locked until live mode is re-confirmed`);
+      } else if (s.mode === "live") {
+        // was live, nothing held: back to a clean paper book
+        this.switchBooks(this.paperBalance);
       }
 
       this.startedAt = Date.now();
@@ -271,6 +293,7 @@ class Engine {
           marketFocus: this.settings.marketFocus,
           startBalance: this.settings.startBalance,
           balance: this.settings.balance,
+          paperBalance: this.paperBalance,
           maxPositionPct: this.settings.maxPositionPct,
           stopLossPct: this.settings.stopLossPct,
           tp1Pct: this.settings.tp1Pct,
@@ -476,6 +499,12 @@ balance ${fmtUsd(this.settings.balance)}`);
     if (!this.settings.running) {
       this.phase = "PAUSED";
       this.phaseDetail = "bot paused by operator";
+      // pausing stops new entries only — real positions keep their stops and targets
+      if (this.positions.some((p) => p.live)) {
+        try { await this.managePositions(); } catch { /* keep loop alive */ }
+        this.phaseDetail = "paused · live exits still managed";
+        await this.flushLogs();
+      }
       return;
     }
     try {
@@ -636,23 +665,49 @@ balance ${fmtUsd(this.settings.balance)}`);
   ) {
     // target manager wins: never enter while booked out / circuit-broken (daily or weekly)
     if (this.halted || this.targetHit || this.weekTargetHit || this.weekHalted) return;
+    const live = this.settings.mode === "live";
+    if (live) {
+      // real money: only Coinbase-listed majors priced from the real Coinbase feed, never simulated data
+      if (this.liveEntriesLocked) return;
+      if (pair.market !== "majors" || pair.source !== "coinbase" || k.simulated) return;
+    }
     const conf = clamp(0.6 + (0.8 * (score - this.brain.scoreThreshold)) / 30, 0.6, 1.4);
     const sizePct = clamp(this.settings.maxPositionPct * conf * this.brain.sizeMultiplier, 1, 15);
-    const sizeUsd = (this.settings.balance * sizePct) / 100;
+    let sizeUsd = (this.settings.balance * sizePct) / 100;
+    if (live) sizeUsd = Math.min(sizeUsd, liveLimits().maxOrderUsd);
     if (sizeUsd < 5) {
       this.log("INFO", `${pair.base} size $${sizeUsd.toFixed(2)} below min — skipped`);
       return;
     }
     const slip = pair.market === "majors" ? 0.0004 : 0.004;
-    const entry = pair.price * (1 + slip);
+    let entry = pair.price * (1 + slip);
+    let qty = sizeUsd / entry;
+    let liveOrderId = "";
+    if (live) {
+      // place the REAL market buy first; everything below is built from what actually filled
+      try {
+        const [prod] = await cbProducts([toProductId(pair.symbol)], 1500);
+        if (!prod?.tradable) throw new Error("product not tradable on Coinbase");
+        if (sizeUsd < prod.quoteMin) throw new Error(`size below Coinbase minimum $${prod.quoteMin}`);
+        const fill = await cbMarketOrder(prod.id, "BUY", { quoteUsd: sizeUsd, quoteInc: prod.quoteIncrement });
+        sizeUsd = fill.grossUsd + fill.feesUsd;
+        qty = fill.filledSize;
+        entry = sizeUsd / qty; // fee-inclusive cost basis per coin
+        liveOrderId = fill.orderId;
+      } catch (e) {
+        this.log("RISK", `LIVE BUY ${pair.base} failed · ${e instanceof Error ? e.message : "error"} · no position opened`);
+        await this.flushLogs();
+        return;
+      }
+    }
     // brain-tuned per-strategy params shape the targets
     const sp = stratParams(this.brain, strategy);
     const t = computeTargets(entry, pair.market, k, { stopMult: sp.stopMult, tpMult: sp.tpMult });
     const holdMin = Math.max(5, Math.round(this.settings.maxHoldMinutes * sp.holdMult));
-    const qty = sizeUsd / entry;
 
+    let row: { id: string } | null = null;
     try {
-      const row = await db.trade.create({
+      row = await db.trade.create({
         data: {
           symbol: pair.symbol,
           name: pair.base,
@@ -667,6 +722,8 @@ balance ${fmtUsd(this.settings.balance)}`);
           tp1: t.tp1,
           tp2: t.tp2,
           status: "open",
+          mode: live ? "live" : "paper",
+          heldQty: live ? qty : 0,
           featuresJson: JSON.stringify({
             vol: this.volatility,
             threshold: this.brain.scoreThreshold,
@@ -678,8 +735,14 @@ balance ${fmtUsd(this.settings.balance)}`);
           }),
         },
       });
+    } catch {
+      if (!live) return; // paper: db fail — skip
+      // live: the coins are already bought — never lose track of them
+      this.log("RISK", `LIVE ${pair.base} bought (order ${liveOrderId}) but DB write failed · tracking in memory only`);
+    }
+    try {
       this.positions.push({
-        id: row.id,
+        id: row?.id ?? `mem-${liveOrderId}`,
         symbol: pair.symbol,
         base: pair.base,
         name: pair.name,
@@ -703,15 +766,16 @@ balance ${fmtUsd(this.settings.balance)}`);
         tp1Booked: false,
         entryScores,
         source: pair.source,
+        ...(live ? { live: true, heldQty: qty, bankedPnl: 0 } : {}),
       });
       this.tradeCount += 1;
       this.log(
         "ENTER",
-        `${pair.base} ${strategy} · ${sizePct.toFixed(1)}% size ${fmtUsd(sizeUsd)} · score ${score} · stop −${((1 - t.stopLoss / entry) * 100).toFixed(1)}% set before entry`
+        `${live ? "LIVE " : ""}${pair.base} ${strategy} · ${sizePct.toFixed(1)}% size ${fmtUsd(sizeUsd)} · score ${score} · stop −${((1 - t.stopLoss / entry) * 100).toFixed(1)}% set before entry`
       );
       if (decisionReason) this.log("EXEC", `${pair.base} strategy pick · ${decisionReason}`);
       this.phaseDetail = `EXECUTOR filled ${pair.base} ${fmtUsd(sizeUsd)} · stop + targets armed`;
-    } catch { /* db fail — skip */ }
+    } catch { /* log/phase failure is cosmetic */ }
   }
 
   // ───────────── RISK agent ─────────────
@@ -720,7 +784,11 @@ balance ${fmtUsd(this.settings.balance)}`);
     if (this.positions.length === 0) return;
     const priceMap = await this.getPrices(this.positions.map((p) => p));
     const stillOpen: Position[] = [];
-    for (const pos of this.positions) {
+    for (const pos of [...this.positions]) {
+      if (pos.live && !priceMap.has(pos.symbol)) {
+        stillOpen.push(pos); // no real Coinbase price this tick — don't act on stale data
+        continue;
+      }
       const px = priceMap.get(pos.symbol) ?? pos.price;
       pos.price = px;
       pos.pnlPct = ((px - pos.entryPrice) / pos.entryPrice) * 100;
@@ -752,13 +820,25 @@ balance ${fmtUsd(this.settings.balance)}`);
     else if (heldMin > holdMin) reason = "timeout";
 
     if (reason) {
-      await this.closePosition(pos, px, reason);
-      return true;
+      return await this.closePosition(pos, px, reason); // false (live sell failed) → stays open, retried
     }
 
     if (!pos.tp1Booked && px >= pos.tp1) {
       // book half at TP1, arm trailing on the runner
-      const booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2;
+      let booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2;
+      if (pos.live) {
+        // real partial sell; if it can't be placed, trail the whole position instead of retrying every tick
+        const held = pos.heldQty ?? pos.qty;
+        const r = await this.liveSell(pos, held / 2);
+        if (r) {
+          booked = r.netUsd - pos.entryPrice * r.soldQty;
+          pos.heldQty = held - r.soldQty;
+          pos.bankedPnl = (pos.bankedPnl ?? 0) + booked;
+        } else {
+          booked = 0;
+          this.log("RISK", `${pos.base} TP1 partial sell failed · trailing the full position instead`);
+        }
+      }
       this.settings.balance += booked;
       pos.tp1Booked = true;
       pos.trailActive = true;
@@ -767,7 +847,12 @@ balance ${fmtUsd(this.settings.balance)}`);
       try {
         await db.trade.update({
           where: { id: pos.id },
-          data: { realizedPnl: { increment: booked }, trailActive: true, peakPrice: px },
+          data: {
+            realizedPnl: { increment: booked },
+            trailActive: true,
+            peakPrice: px,
+            ...(pos.live ? { heldQty: pos.heldQty ?? pos.qty } : {}),
+          },
         });
       } catch { /* ok */ }
       await this.persistSettings();
@@ -775,15 +860,46 @@ balance ${fmtUsd(this.settings.balance)}`);
     return false;
   }
 
-  async closePosition(pos: Position, px: number, reason: string) {
+  /** real market sell of `qty` coins; returns the fee-adjusted result, or null (logged + backed off) on failure */
+  async liveSell(pos: Position, qty: number): Promise<{ netUsd: number; soldQty: number; netPrice: number } | null> {
+    if (Date.now() < (this.sellBackoff.get(pos.id) ?? 0)) return null;
+    try {
+      if (!cbConfigured()) throw new Error("coinbase credentials missing — cannot sell");
+      const [prod] = await cbProducts([toProductId(pos.symbol)], 1500);
+      if (!prod) throw new Error("product not found");
+      const fill = await cbMarketOrder(prod.id, "SELL", { baseQty: qty, baseInc: prod.baseIncrement });
+      this.sellBackoff.delete(pos.id);
+      const netUsd = fill.grossUsd - fill.feesUsd;
+      return { netUsd, soldQty: fill.filledSize, netPrice: netUsd / fill.filledSize };
+    } catch (e) {
+      this.sellBackoff.set(pos.id, Date.now() + 30_000);
+      const msg = e instanceof Error ? e.message : "error";
+      this.log("RISK", `LIVE SELL ${pos.base} FAILED · ${msg} · position still open, retrying in 30s`);
+      if (tgEnabledFor("breaker")) tgNotify("breaker", "⚠️ LIVE SELL FAILED", `${pos.base}: ${msg}\nthe position is still open on Coinbase — check it manually`);
+      return null;
+    }
+  }
+
+  /** returns false when a live sell failed — the position is then left open and retried */
+  async closePosition(pos: Position, px: number, reason: string): Promise<boolean> {
+    let realizedLive: number | undefined;
+    if (pos.live) {
+      const r = await this.liveSell(pos, pos.heldQty ?? pos.qty);
+      if (!r) return false;
+      px = r.netPrice; // fee-adjusted effective sell price
+      realizedLive = r.netUsd - pos.entryPrice * r.soldQty + (pos.bankedPnl ?? 0);
+    }
     const remainingQty = pos.qty * (pos.tp1Booked ? 0.5 : 1);
-    const realized = (px - pos.entryPrice) * remainingQty + (pos.tp1Booked ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 : 0);
+    const banked = pos.live ? pos.bankedPnl ?? 0 : pos.tp1Booked ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 : 0;
+    const realized = realizedLive ?? (px - pos.entryPrice) * remainingQty + banked;
     const pnlPct = ((px - pos.entryPrice) / pos.entryPrice) * 100;
     const plannedRiskPct = Math.abs(((pos.stopLoss - pos.entryPrice) / pos.entryPrice) * 100) || 8;
     const reward = clamp((reason === "stop" ? -plannedRiskPct : pnlPct) / plannedRiskPct, -1, 1);
     const won = realized >= 0;
 
-    this.settings.balance += realized;
+    this.settings.balance += realized - banked; // the TP1 half was already added to balance when it booked
+    this.positions = this.positions.filter((p) => p.id !== pos.id); // closeAll() never removed these before
+    this.sellBackoff.delete(pos.id);
     // target manager: book realized P&L into today + this week
     this.rolloverIfNeeded();
     this.dayPnl += realized;
@@ -813,7 +929,7 @@ balance ${fmtUsd(this.settings.balance)}`);
       reason,
       pos.entryScores
     );
-    this.log(won ? "WIN" : "LOSS", `${pos.base} ${won ? "+" : "–"}$${Math.abs(realized).toFixed(2)} · ${exitLabel} · day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)}`);
+    this.log(won ? "WIN" : "LOSS", `${pos.live ? "LIVE " : ""}${pos.base} ${won ? "+" : "–"}$${Math.abs(realized).toFixed(2)} · ${exitLabel} · day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)}`);
 
     for (const ev of events) {
       const [lvl, ...rest] = ev.split(" ");
@@ -849,6 +965,7 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
           exitReason: reason,
           realizedPnl: realized,
           pnlPct,
+          heldQty: 0,
           closedAt: new Date(),
         },
       });
@@ -874,10 +991,21 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       });
     } catch { /* ok */ }
     await this.persistSettings();
+    return true;
   }
 
   async getPrices(positions: Position[]): Promise<Map<string, number>> {
     const map = new Map<string, number>();
+    // live positions are priced ONLY from Coinbase (fresh) — never from the sim fallback
+    const livePos = positions.filter((p) => p.live);
+    if (livePos.length) {
+      try {
+        for (const pr of await cbProducts(livePos.map((p) => toProductId(p.symbol)), 1500)) {
+          for (const p of livePos) if (toProductId(p.symbol) === pr.id) map.set(p.symbol, pr.price);
+        }
+      } catch { /* no price this tick → risk check is skipped for live positions */ }
+    }
+    positions = positions.filter((p) => !p.live);
     const majorSyms = positions.filter((p) => p.market === "majors").map((p) => p.symbol);
     const memeSyms = positions.filter((p) => p.market === "memecoin").map((p) => p.symbol);
     if (majorSyms.length) {
@@ -956,6 +1084,10 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
   }
 
   async reset() {
+    if (this.settings.mode === "live") {
+      this.log("RISK", "reset refused while in LIVE mode · switch live off first (that sells any open live positions)");
+      return;
+    }
     for (const p of this.positions) {
       try {
         await db.trade.update({
@@ -997,6 +1129,85 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       await db.brainState.create({ data: { id: "main", weightsJson: JSON.stringify(this.brain.weights) } });
     } catch { /* ok */ }
     await this.persistSettings();
+  }
+
+  // ───────────── live trading switch ─────────────
+
+  /** start a fresh set of P&L books (used when crossing between paper and live) */
+  switchBooks(balance: number) {
+    this.settings.balance = balance;
+    this.settings.startBalance = balance;
+    this.dayStartBalance = balance;
+    this.weekStartBalance = balance;
+    this.dayPnl = 0;
+    this.weekPnl = 0;
+    this.targetHit = false;
+    this.weekTargetHit = false;
+    this.halted = false;
+    this.weekHalted = false;
+  }
+
+  /** paper → live. Every gate is re-checked here, server-side, on every call. */
+  async enableLive(confirm: string): Promise<{ ok: boolean; error?: string }> {
+    const gate = liveGate();
+    if (!gate.ok) return { ok: false, error: gate.problems.join("; ") };
+    if (confirm.trim() !== "ENABLE LIVE") return { ok: false, error: "type ENABLE LIVE to confirm" };
+
+    if (this.settings.mode === "live") {
+      // already live (e.g. restarted with open positions): confirming just unlocks new entries
+      this.liveEntriesLocked = false;
+      this.log("RISK", "LIVE entries unlocked by operator");
+      return { ok: true };
+    }
+    if (this.positions.length > 0) return { ok: false, error: "close all open paper positions first" };
+
+    let usd = 0;
+    try {
+      usd = (await cbAccounts()).find((a) => a.currency === "USD")?.available ?? 0;
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : "could not read Coinbase account" };
+    }
+    const { bankrollCap, maxOrderUsd } = liveLimits();
+    const bankroll = Math.floor(Math.min(usd, bankrollCap) * 100) / 100;
+    if (bankroll < 20) return { ok: false, error: `need at least $20 available USD on Coinbase (have $${usd.toFixed(2)})` };
+
+    this.paperBalance = this.settings.balance;
+    this.paperStartBalance = this.settings.startBalance;
+    this.settings.mode = "live";
+    this.settings.marketFocus = "majors"; // memecoins aren't on Coinbase
+    this.liveEntriesLocked = false;
+    this.switchBooks(bankroll);
+    this.universeAt = 0; // refresh the universe from the Coinbase feed now
+    this.log("RISK", `LIVE TRADING ENABLED · bankroll $${bankroll.toFixed(2)} (cap $${bankrollCap}, $${usd.toFixed(2)} USD available) · max order $${maxOrderUsd} · majors only`);
+    if (tgEnabledFor("breaker")) tgNotify("breaker", "⚠️ LIVE trading enabled", `bankroll $${bankroll.toFixed(2)} · max order $${maxOrderUsd} · Coinbase majors only`);
+    await this.persistSettings();
+    return { ok: true };
+  }
+
+  /** live → paper. Sells every open live position first; refuses to switch if any sell fails. */
+  async disableLive(): Promise<{ ok: boolean; error?: string }> {
+    if (this.settings.mode !== "live") return { ok: true };
+    this.sellBackoff.clear(); // operator asked: try now
+    if (this.positions.some((p) => p.live)) await this.closeAll("manual");
+    if (this.positions.some((p) => p.live)) {
+      return { ok: false, error: "some live positions could not be sold — see the log; still in LIVE mode" };
+    }
+    this.settings.mode = "paper";
+    this.liveEntriesLocked = false;
+    this.switchBooks(this.paperBalance);
+    this.settings.startBalance = this.paperStartBalance;
+    this.log("RISK", "LIVE trading disabled · back to paper · no live positions open");
+    await this.persistSettings();
+    return { ok: true };
+  }
+
+  liveStatus() {
+    return {
+      mode: this.settings.mode,
+      entriesLocked: this.liveEntriesLocked,
+      bankroll: this.settings.mode === "live" ? this.settings.balance : null,
+      openLive: this.positions.filter((p) => p.live).length,
+    };
   }
 
   updateSettings(patch: Partial<Settings>) {
@@ -1081,7 +1292,7 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
         id: "scout",
         name: "SCOUT",
         badge: "SCAN",
-        desc: this.settings.marketFocus === "memecoins" ? "finds fresh pairs — DexScreener solana · mcap $250k–$15M" : this.settings.marketFocus === "majors" ? "watches 10 majors — Binance spot · 24h vol ≥ $50M" : "watches majors + fresh solana pairs — two feeds, one desk",
+        desc: this.settings.marketFocus === "memecoins" ? "finds fresh pairs — DexScreener solana · mcap $250k–$15M" : this.settings.marketFocus === "majors" ? "watches majors — Coinbase spot (USD) · liquidity-filtered" : "watches majors + fresh solana pairs — two feeds, one desk",
         status: this.phase === "SCANNING" ? "SCAN" : "LIVE",
         statusTone: "green",
         activity: `seen ${this.seen.toLocaleString()} → ${this.queue.length} queued`,

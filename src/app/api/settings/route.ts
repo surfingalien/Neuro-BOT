@@ -44,7 +44,6 @@ export async function GET() {
     closeOnTarget: s.closeOnTarget,
     scoreThreshold: engine.brain.scoreThreshold,
     tg: engine.snapshot().tg, // enabled / configured / masked / sentCount — token never echoed
-    binanceKeySet: false, // keys are never echoed back
   });
 }
 
@@ -98,14 +97,6 @@ export async function POST(req: Request) {
     const chatId = typeof body.tgChatId === "string" && body.tgChatId.trim() ? body.tgChatId.trim() : "";
     const res = await tgSendTest(token, chatId);
     return NextResponse.json({ ok: res.ok, tgTest: res, snapshot: engine.snapshot() });
-  }
-
-  // live-trading keys: accept + store obfuscated, never returned.
-  // Live execution stays disabled in this sandbox build.
-  const key = body.binanceKey;
-  const secret = body.binanceSecret;
-  if (typeof key === "string" && key.length > 0 && typeof secret === "string" && secret.length > 0) {
-    engine.log("INFO", "binance api credentials stored (encrypted at rest) · live execution stays OFF in sandbox build");
   }
 
   return NextResponse.json({ ok: true, snapshot: engine.snapshot() });
