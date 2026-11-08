@@ -36,7 +36,7 @@ export interface ScoutPair {
   txns1h: number;
   buys1h: number;
   sells1h: number;
-  source: string; // binance | dexscreener | sim
+  source: string; // coinbase | binance | dexscreener | sim
 }
 
 export interface FilterRuleResult {
@@ -93,6 +93,10 @@ export interface Position {
   tp1Booked: boolean;
   entryScores: number[]; // 6 analyst sub-scores at entry (0-100) — feeds research learning
   source: string;
+  // ── live (real Coinbase order) positions only ──
+  live?: boolean;
+  heldQty?: number; // coins actually still held
+  bankedPnl?: number; // real P&L already banked by the TP1 partial sell
 }
 
 export type AgentId =
