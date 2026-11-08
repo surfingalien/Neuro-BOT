@@ -38,6 +38,26 @@ from SQLite, and starts its 3-second tick loop as a singleton
 
 ---
 
+## Deploying (Railway)
+
+The repo ships a `Dockerfile` + `railway.json`; Railway builds it automatically.
+
+1. New Project → Deploy from GitHub repo → this repo.
+2. **Add a Volume** mounted at `/data` (the SQLite file lives at `/data/custom.db`;
+   without a volume, state resets on every deploy).
+3. Settings → Networking → Generate Domain. No port needed: the app listens on
+   `$PORT` and binds `0.0.0.0` (binding the container hostname is what causes
+   "Application failed to respond").
+4. Optional env: `DATABASE_URL` (defaults to `file:/data/custom.db`).
+
+The container runs `prisma db push` on boot, so the schema is created/synced
+automatically. The engine is a long-lived in-process loop with SQLite, so run a
+**single instance** (no horizontal scaling) and use a host with a persistent
+process, not serverless.
+
+> The control panel has no login. Anyone with the URL can pause/reset the bot or
+> change Telegram settings, so keep the URL private or put it behind an auth proxy.
+
 ## What's inside
 
 ### 6-agent pipeline (hard handoffs, one job each)

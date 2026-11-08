@@ -6,7 +6,7 @@
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
     "postinstall": "prisma generate",
     "build": "prisma generate && next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
-    "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
+    "start": "prisma db push --skip-generate && NODE_ENV=production HOSTNAME=0.0.0.0 node .next/standalone/server.js",
     "lint": "eslint .",
     "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",
