@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Singleton settings row (id = "main")
+model Setting {
+  id               String   @id @default("main")
+  mode             String   @default("paper") // paper | live (live gated)
+  running          Boolean  @default(true)
+  marketFocus      String   @default("both") // majors | memecoins | both
+  startBalance     Float    @default(1000)
+  balance          Float    @default(1000)
+  maxPositionPct   Float    @default(8)
+  stopLossPct      Float    @default(8)
+  tp1Pct           Float    @default(8)
+  tp2Pct           Float    @default(20)
+  trailActivationPct Float  @default(12)
+  trailGapPct      Float    @default(15)
+  maxPositions     Int      @default(5)
+  scoreThreshold   Int      @default(70)
+  maxHoldMinutes   Int      @default(360)
+  dailyLossCapPct  Float    @default(15)
+  // ── target manager: book profit / loss by targets ──
+  dailyProfitTargetPct Float  @default(4)   // day P&L ≥ this → book & lock
+  closeOnTarget    Boolean  @default(true)  // force-close opens when target hit
+  dayKey           String   @default("")    // UTC day "2026-11-08"
+  dayPnl           Float    @default(0)     // realized today
+  weekKey          String   @default("")    // ISO week "2026-W45"
+  weekPnl          Float    @default(0)     // realized this week
+  dayStartBalance  Float    @default(1000)
+  targetHit        Boolean  @default(false) // daily profit target booked — locked until next UTC day
+  // ── weekly targets: same booking semantics, bigger horizon ──
+  weeklyProfitTargetPct Float  @default(15)  // week P&L ≥ this → book & lock
+  weeklyLossCapPct Float    @default(25)    // week P&L ≤ −this → breaker books loss
+  weekStartBalance Float    @default(1000)
+  weekTargetHit    Boolean  @default(false) // weekly target booked — locked until next UTC week
+  weekHalted       Boolean  @default(false) // weekly loss cap hit — resume manually
+  // ── telegram alerts ──
+  tgToken          String   @default("")    // bot token — never echoed back
+  tgChatId         String   @default("")    // chat / channel id — never echoed back
+  tgEnabled        Boolean  @default(false)
+  tgEventsJson     String   @default("{\"target\":true,\"breaker\":true,\"trades\":true,\"brain\":true}")
+  binanceKeyEnc    String?  @default("")
+  binanceSecretEnc String?  @default("")
+  updatedAt        DateTime @updatedAt
+}
+
+model Trade {
+  id            String   @id @default(cuid())
+  symbol        String
+  name          String   @default("")
+  market        String // majors | memecoin
+  strategy      String // momentum | meanrev | breakout
+  entryPrice    Float
+  exitPrice     Float?
+  sizeUsd       Float
+  qty           Float
+  score         Int
+  regime        String   @default("ranging")
+  stopLoss      Float
+  tp1           Float
+  tp2           Float
+  trailActive   Boolean  @default(false)
+  peakPrice     Float    @default(0)
+  status        String   @default("open") // open | closed
+  exitReason    String? // stop | tp1 | tp2 | trail | timeout | manual
+  realizedPnl   Float    @default(0)
+  pnlPct        Float    @default(0)
+  featuresJson  String   @default("{}") // analyst sub-scores snapshot
+  openedAt      DateTime @default(now())
+  closedAt      DateTime?
+}
+
+model LogEvent {
+  id     Int      @id @default(autoincrement())
+  level  String // KILL | SCORE | ENTER | WIN | LOSS | STOP | TRAIL | PASS | BRAIN | BOOT | INFO | RISK
+  text   String
+  ts     DateTime @default(now())
+}
+
+model BrainState {
+  id              String   @id @default("main")
+  weightsJson     String   @default("{}") // { momentum: 0.33, meanrev: 0.33, breakout: 0.34 }
+  lessonsJson     String   @default("[]") // generated insight lines
+  regime          String   @default("unknown")
+  volatility      String   @default("normal")
+  scoreThreshold  Int      @default(70)
+  sizeMultiplier  Float    @default(1)
+  autotuneCount   Int      @default(0)
+  // ── self-improvement: research engine + strategy params ──
+  signalWeightsJson String @default("[]") // 6 analyst signal weights (learned)
+  stratParamsJson   String @default("{}") // per-strategy { holdMult, stopMult, tpMult }
+  closedSinceAutotune Int  @default(0)
+  updatedAt       DateTime @updatedAt
+}
