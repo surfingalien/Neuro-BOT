@@ -61,7 +61,17 @@ export default function HeaderBar({
           >
             {snap.mode} {snap.mode === "paper" ? "✓" : "•"}
           </span>
-          <span className="border border-slate-700/60 rounded-full px-2.5 py-1 text-slate-600">live</span>
+          <a
+            href="#coinbase"
+            title="Coinbase balance & live trading"
+            className={`border rounded-full px-2.5 py-1 text-[10px] transition-colors ${
+              snap.mode === "live"
+                ? "border-rose-500/60 text-rose-300 bg-rose-500/10 nb-pulse"
+                : "border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500"
+            }`}
+          >
+            {snap.mode === "live" ? "● live" : "go live ↓"}
+          </a>
         </div>
       </div>
 
