@@ -111,29 +111,62 @@ export function runAnalyst(
   else if (r > 72) momentum += 5;
   momentum += clamp(slope * 12, -10, 15);
 
-  // 2. unique buyers proxy — txn intensity vs liquidity
-  const txnIntensity = pair.liquidity > 0 ? (pair.txns1h * 2200) / pair.liquidity : 0;
-  const buyers = clamp(30 + txnIntensity * 90, 5, 100);
+  const majors = pair.market === "majors" && !analystCfg.legacyMajorSignals;
 
-  // 3. buy/sell ratio
-  const bs =
-    pair.market === "majors"
-      ? 1 + (pair.buys1h - pair.sells1h) / Math.max(1, pair.buys1h + pair.sells1h)
-      : pair.sells1h > 0
-        ? pair.buys1h / pair.sells1h
-        : 1.6;
-  const buySell = clamp((bs / 1.8) * 100, 5, 100);
+  // 2. unique buyers proxy (memecoins) / relative volume (majors)
+  // Majors used to score a CONSTANT here (txns were synthesized from volume with fixed ratios), so the
+  // "research" layer was learning from numbers that never moved. Majors now use real candle data.
+  let buyers: number;
+  if (majors) {
+    const avg = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+    const v60 = avg(vols.slice(-60));
+    const rv = v60 > 0 ? avg(vols.slice(-5)) / v60 : 1; // last 5 minutes vs the last hour
+    buyers = clamp(20 + (rv - 0.5) * 32, 5, 100);
+  } else {
+    const txnIntensity = pair.liquidity > 0 ? (pair.txns1h * 2200) / pair.liquidity : 0;
+    buyers = clamp(30 + txnIntensity * 90, 5, 100);
+  }
+
+  // 3. buy/sell ratio (memecoins) / buying pressure (majors: volume-weighted close location in each candle's range)
+  let buySell: number;
+  if (majors) {
+    let num = 0;
+    let den = 0;
+    for (const c of k.m1.slice(-30)) {
+      const range = c.h - c.l;
+      num += (range > 0 ? (c.c - c.l - (c.h - c.c)) / range : 0) * c.v;
+      den += c.v;
+    }
+    buySell = clamp(50 + (den > 0 ? num / den : 0) * 50, 5, 100);
+  } else {
+    const bs =
+      pair.market === "majors"
+        ? 1 + (pair.buys1h - pair.sells1h) / Math.max(1, pair.buys1h + pair.sells1h) // legacy: constant for majors
+        : pair.sells1h > 0
+          ? pair.buys1h / pair.sells1h
+          : 1.6;
+    buySell = clamp((bs / 1.8) * 100, 5, 100);
+  }
 
   // 4. holder growth proxy — consistent uptrend in closes
   const lookback = closes.slice(-40);
   const upBars = lookback.filter((c, i) => i > 0 && c > lookback[i - 1]).length;
   const holderGrowth = clamp((upBars / Math.max(1, lookback.length - 1)) * 130 - 10, 5, 100);
 
-  // 5. liquidity / mcap quality
-  const liqScore =
-    pair.market === "majors"
-      ? 85
-      : clamp(pair.mcap > 0 ? (pair.liquidity / pair.mcap) * 1600 : 10, 5, 100);
+  // 5. liquidity / mcap quality (memecoins) / higher-timeframe trend (majors; was a constant 85)
+  let liqScore: number;
+  if (majors) {
+    const h = k.h1.map((c) => c.c);
+    if (h.length >= 22) {
+      const e = ema(h, 20);
+      const last1h = h[h.length - 1];
+      const dist = ((last1h - e[e.length - 1]) / e[e.length - 1]) * 100; // % above/below the 20h EMA
+      const slope1h = e[e.length - 1] - e[e.length - 6];
+      liqScore = clamp(50 + clamp(dist * 12, -35, 35) + (slope1h > 0 ? 10 : -10), 5, 100);
+    } else liqScore = 50;
+  } else {
+    liqScore = pair.market === "majors" ? 85 : clamp(pair.mcap > 0 ? (pair.liquidity / pair.mcap) * 1600 : 10, 5, 100);
+  }
 
   // 6. smart money proxy — volume consistency + BB squeeze (coiled spring)
   const vc = volumeConsistency(vols);
@@ -158,10 +191,10 @@ export function runAnalyst(
     base: pair.base,
     scores: [
       { label: "momentum", value: Math.round(clamp(momentum, 0, 100)) },
-      { label: "unique buyers", value: Math.round(buyers) },
-      { label: "buy / sell ratio", value: Math.round(buySell) },
+      { label: majors ? "rel. volume" : "unique buyers", value: Math.round(buyers) },
+      { label: majors ? "buy pressure" : "buy / sell ratio", value: Math.round(buySell) },
       { label: "holder growth", value: Math.round(holderGrowth) },
-      { label: "liquidity / mcap", value: Math.round(liqScore) },
+      { label: majors ? "1h trend" : "liquidity / mcap", value: Math.round(liqScore) },
       { label: "smart wallets", value: Math.round(smart) },
     ],
     final,
@@ -176,6 +209,12 @@ export interface TargetMults {
   tpMult?: number;
 }
 
+/** research switch: true restores the old majors scoring (three constant signals) for A/B experiments. Default false. */
+export const analystCfg = { legacyMajorSignals: false };
+
+/** tunable for research (backtest experiments); the live defaults are unchanged */
+export const targetCfg = { stopFloorPct: 1.0, tp1Mult: 1.1, tp2Mult: 2.2 };
+
 export function computeTargets(
   entry: number,
   market: "majors" | "memecoin",
@@ -187,12 +226,12 @@ export function computeTargets(
   const a = atr(k.m1, 14);
   const atrPct = (a / entry) * 100;
   if (market === "majors") {
-    const slPct = clamp(Math.max(1.0, atrPct * 1.6 * stopM), 1.0, 5);
+    const slPct = clamp(Math.max(targetCfg.stopFloorPct, atrPct * 1.6 * stopM), targetCfg.stopFloorPct, Math.max(5, targetCfg.stopFloorPct));
     return {
       stopLoss: entry * (1 - slPct / 100),
-      tp1: entry * (1 + (slPct * 1.1 * tpM) / 100),
-      tp2: entry * (1 + (slPct * 2.2 * tpM) / 100),
-      trailAct: entry * (1 + (slPct * 2.2 * tpM) / 100),
+      tp1: entry * (1 + (slPct * targetCfg.tp1Mult * tpM) / 100),
+      tp2: entry * (1 + (slPct * targetCfg.tp2Mult * tpM) / 100),
+      trailAct: entry * (1 + (slPct * targetCfg.tp2Mult * tpM) / 100),
     };
   }
   return {

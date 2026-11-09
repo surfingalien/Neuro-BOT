@@ -16,6 +16,7 @@ model Setting {
   startBalance     Float    @default(1000)
   balance          Float    @default(1000)
   paperBalance     Float    @default(1000)  // paper balance parked while mode = live
+  validationJson   String   @default("")    // last live-trading validation record (see engine.runValidation)
   maxPositionPct   Float    @default(8)
   stopLossPct      Float    @default(8)
   tp1Pct           Float    @default(8)

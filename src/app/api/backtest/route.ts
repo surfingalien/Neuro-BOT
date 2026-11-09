@@ -13,7 +13,7 @@ export async function GET() {
 export async function POST(req: Request) {
   const engine = await getEngine();
   let body: {
-    action?: "run" | "apply";
+    action?: "run" | "apply" | "validate";
     scope?: MarketFocus;
     bars?: number;
     useLiveBrain?: boolean;
@@ -23,6 +23,16 @@ export async function POST(req: Request) {
     body = (await req.json()) as typeof body;
   } catch {
     return NextResponse.json({ error: "bad body" }, { status: 400 });
+  }
+
+  if (body.action === "validate") {
+    if (backtestBusy()) return NextResponse.json({ error: "a backtest is already running — try again in a minute" }, { status: 409 });
+    try {
+      const record = await engine.runValidation();
+      return NextResponse.json({ ok: true, record, status: engine.validationStatus() });
+    } catch (e) {
+      return NextResponse.json({ error: e instanceof Error ? e.message : "validation failed" }, { status: 500 });
+    }
   }
 
   if (body.action === "apply") {

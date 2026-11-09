@@ -97,6 +97,31 @@ The strategy is experimental; it can and will lose money. Start with a bankroll 
 
 ---
 
+## Does the strategy actually make money? (research + the live gate)
+
+Short version, measured on **real Coinbase candles, after realistic fees (0.6% per side)**:
+
+| What was tested | Result |
+|---|---|
+| Current 1-minute engine, ~7 days, 10 majors | about break-even **before** fees, loses ~2-6% **after** fees |
+| Same engine with wider stops/targets (2-4% stops) | still negative; exits just become timeouts |
+| Same engine with the repaired analyst signals | still negative (more trades = more fees) |
+| 1h trend-breakout, walk-forward over 4 unseen 60-day windows | **-31%** (1/4 windows profitable) |
+| 1h uptrend-pullback, same method | **-31%** (0/4 windows profitable) |
+| Weekly momentum rotation, same method | **+9.7%** vs buy-and-hold -2.7%, but worst window -12%, max drawdown 25%, different parameters every window, 51 trades: not trustworthy yet |
+
+Reproduce the hourly walk-forward (downloads ~1 year of candles once, then cached): `bun run scripts/research.ts`.
+The harness (`src/lib/engine/research.ts`) fills trades at the *next* bar's open, checks stops against the bar's low,
+charges fees + slippage on every fill, and judges parameters only on windows they were not chosen on.
+
+**Live trading is gated on this.** Before you can switch to live, press **RUN VALIDATION** in the Coinbase panel: it
+replays the active strategy over ~7 days of real Coinbase data with fees and requires a positive net result, 20+ trades,
+a non-losing second half and max drawdown <= 10%. A pass expires after 3 days. If you accept the risk anyway you can set
+`LIVE_SKIP_VALIDATION=true` (the panel then says "SKIPPED (override)").
+
+Other related settings: `PAPER_FEE_PCT` (paper-mode fee per side, default 0.6 for majors) and, in live mode, the bot no
+longer takes random "exploration" strategy samples.
+
 ## What's inside
 
 ### 6-agent pipeline (hard handoffs, one job each)
