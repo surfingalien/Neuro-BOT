@@ -10,13 +10,31 @@ interface CbInfo {
   liveProblems: string[];
   limits: { bankrollCap: number; maxOrderUsd: number };
   keyInfo: { name: string; nameLooksRight: boolean; keyType: string; keyError?: string } | null;
-  live: { mode: "paper" | "live"; entriesLocked: boolean; bankroll: number | null; openLive: number };
+  live: {
+    mode: "paper" | "live";
+    entriesLocked: boolean;
+    bankroll: number | null;
+    openLive: number;
+    feed: string;
+    gate: number;
+    running: boolean;
+    diag: { lastSkip: string; lastSkipAt: number; lastError: string; lastErrorAt: number; buys: number; sells: number; lastOrderAt: number };
+  };
   holdings: Holding[];
   usd: number;
   totalUsd: number;
   error?: string;
   outboundIp?: string;
 }
+
+interface Exec {
+  id: string; base: string; strategy: string; status: string; entryPrice: number; exitPrice: number | null;
+  sizeUsd: number; realizedPnl: number; exitReason: string | null; openedAt: string; closedAt: string | null;
+}
+const ago = (t: number) => {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  return s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)}m ago` : `${Math.round(s / 3600)}h ago`;
+};
 
 const usd = (n: number) => `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const qtyFmt = (n: number) => (n >= 1000 ? n.toLocaleString(undefined, { maximumFractionDigits: 2 }) : n.toPrecision(6).replace(/\.?0+$/, ""));
@@ -27,6 +45,7 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [execs, setExecs] = useState<Exec[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -35,11 +54,19 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
     } catch { /* retry */ }
   }, []);
 
+  const loadExecs = useCallback(async () => {
+    try {
+      const r = await fetch("/api/trades?mode=live", { cache: "no-store" });
+      if (r.ok) setExecs(((await r.json()) as { trades: Exec[] }).trades.slice(0, 8));
+    } catch { /* retry */ }
+  }, []);
+
   useEffect(() => {
     void load();
-    const t = setInterval(() => void load(), 10_000);
+    void loadExecs();
+    const t = setInterval(() => { void load(); void loadExecs(); }, 10_000);
     return () => clearInterval(t);
-  }, [load]);
+  }, [load, loadExecs]);
 
   const act = async (action: "liveOn" | "liveOff") => {
     setBusy(true);
@@ -151,6 +178,60 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                   {info.holdings.some((h) => h.hold > 0) && <p className="text-[9px] text-slate-600">* includes funds on hold</p>}
                 </div>
               </>
+            )}
+
+            {isLive && (
+              <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3 flex flex-col gap-1.5">
+                <div className="text-[9px] tracking-widest text-slate-600 uppercase">live status</div>
+                <div className="text-[10.5px] text-slate-300 flex flex-wrap gap-x-4 gap-y-1">
+                  <span>feed: <b className={info.live.feed === "coinbase" ? "text-emerald-400" : "text-rose-400"}>{info.live.feed}</b></span>
+                  <span>bot: <b className={info.live.running ? "text-emerald-400" : "text-amber-300"}>{info.live.running ? "running" : "paused"}</b></span>
+                  <span>entries: <b className={info.live.entriesLocked ? "text-amber-300" : "text-emerald-400"}>{info.live.entriesLocked ? "locked" : "open"}</b></span>
+                  <span>score gate: <b>{info.live.gate}</b></span>
+                  <span>orders: <b>{info.live.diag.buys}</b> buys · <b>{info.live.diag.sells}</b> sells{info.live.diag.lastOrderAt ? ` · last ${ago(info.live.diag.lastOrderAt)}` : ""}</span>
+                  <span>open: <b>{info.live.openLive}</b></span>
+                </div>
+                {info.live.diag.lastError && (
+                  <p className="text-[10px] text-rose-400 leading-snug">last order error ({ago(info.live.diag.lastErrorAt)}): {info.live.diag.lastError}</p>
+                )}
+                {info.live.diag.lastSkip && (
+                  <p className="text-[10px] text-amber-300/90 leading-snug">last skipped entry ({ago(info.live.diag.lastSkipAt)}): {info.live.diag.lastSkip}</p>
+                )}
+                {info.live.diag.buys === 0 && !info.live.diag.lastError && !info.live.diag.lastSkip && (
+                  <p className="text-[10px] text-slate-500 leading-snug">
+                    No orders yet. The bot only enters setups scoring {info.live.gate}+ on Coinbase majors, so it can be quiet for hours. Nothing is wrong unless an error appears above.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {execs.length > 0 && (
+              <div className="overflow-x-auto">
+                <div className="text-[9px] tracking-widest text-slate-600 uppercase mb-1">recent live executions</div>
+                <table className="w-full text-[10px]">
+                  <thead>
+                    <tr className="text-slate-600 text-left">
+                      <th className="font-normal py-0.5">asset</th><th className="font-normal">strategy</th>
+                      <th className="font-normal text-right">size</th><th className="font-normal text-right">entry</th>
+                      <th className="font-normal text-right">exit</th><th className="font-normal text-right">net P&amp;L</th>
+                      <th className="font-normal text-right">status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {execs.map((e) => (
+                      <tr key={e.id} className="text-slate-300 border-t border-slate-800/60">
+                        <td className="py-0.5">{e.base}</td><td>{e.strategy}</td>
+                        <td className="text-right">{usd(e.sizeUsd)}</td><td className="text-right">{usd(e.entryPrice)}</td>
+                        <td className="text-right">{e.exitPrice ? usd(e.exitPrice) : "—"}</td>
+                        <td className={`text-right ${e.realizedPnl > 0 ? "text-emerald-400" : e.realizedPnl < 0 ? "text-rose-400" : ""}`}>
+                          {e.status === "closed" ? `${e.realizedPnl >= 0 ? "+" : "–"}${usd(Math.abs(e.realizedPnl))}` : "open"}
+                        </td>
+                        <td className="text-right text-slate-500">{e.status === "closed" ? e.exitReason ?? "closed" : "open"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
             <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">

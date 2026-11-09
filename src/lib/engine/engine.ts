@@ -111,6 +111,16 @@ class Engine {
   paperStartBalance = 1000;
   liveEntriesLocked = false; // booted into live with open positions: manage exits, no new entries until re-confirmed
   sellBackoff = new Map<string, number>(); // position id → earliest next sell attempt
+  liveDiag = { lastSkip: "", lastSkipAt: 0, lastError: "", lastErrorAt: 0, buys: 0, sells: 0, lastOrderAt: 0 };
+
+  /** why a live entry was NOT placed — logged at most once per reason per 5 minutes so the log stays readable */
+  liveSkip(reason: string) {
+    const now = Date.now();
+    if (this.liveDiag.lastSkip === reason && now - this.liveDiag.lastSkipAt < 300_000) return;
+    this.liveDiag.lastSkip = reason;
+    this.liveDiag.lastSkipAt = now;
+    this.log("INFO", `LIVE entry skipped · ${reason}`);
+  }
 
   regime: Regime = "ranging";
   volatility: VolState = "normal";
@@ -668,8 +678,10 @@ balance ${fmtUsd(this.settings.balance)}`);
     const live = this.settings.mode === "live";
     if (live) {
       // real money: only Coinbase-listed majors priced from the real Coinbase feed, never simulated data
-      if (this.liveEntriesLocked) return;
-      if (pair.market !== "majors" || pair.source !== "coinbase" || k.simulated) return;
+      if (this.liveEntriesLocked) return this.liveSkip("new entries are locked after a restart · re-confirm with ENABLE LIVE in the Coinbase panel");
+      if (pair.market !== "majors") return;
+      if (pair.source !== "coinbase") return this.liveSkip(`price feed is "${pair.source}", not Coinbase · real orders need the real Coinbase feed`);
+      if (k.simulated) return this.liveSkip(`${pair.base} candles are simulated · real orders need real Coinbase candles`);
     }
     const conf = clamp(0.6 + (0.8 * (score - this.brain.scoreThreshold)) / 30, 0.6, 1.4);
     const sizePct = clamp(this.settings.maxPositionPct * conf * this.brain.sizeMultiplier, 1, 15);
@@ -694,8 +706,13 @@ balance ${fmtUsd(this.settings.balance)}`);
         qty = fill.filledSize;
         entry = sizeUsd / qty; // fee-inclusive cost basis per coin
         liveOrderId = fill.orderId;
+        this.liveDiag.buys += 1;
+        this.liveDiag.lastOrderAt = Date.now();
       } catch (e) {
-        this.log("RISK", `LIVE BUY ${pair.base} failed · ${e instanceof Error ? e.message : "error"} · no position opened`);
+        const msg = e instanceof Error ? e.message : "error";
+        this.liveDiag.lastError = `BUY ${pair.base}: ${msg}`;
+        this.liveDiag.lastErrorAt = Date.now();
+        this.log("RISK", `LIVE BUY ${pair.base} failed · ${msg} · no position opened`);
         await this.flushLogs();
         return;
       }
@@ -870,10 +887,14 @@ balance ${fmtUsd(this.settings.balance)}`);
       const fill = await cbMarketOrder(prod.id, "SELL", { baseQty: qty, baseInc: prod.baseIncrement });
       this.sellBackoff.delete(pos.id);
       const netUsd = fill.grossUsd - fill.feesUsd;
+      this.liveDiag.sells += 1;
+      this.liveDiag.lastOrderAt = Date.now();
       return { netUsd, soldQty: fill.filledSize, netPrice: netUsd / fill.filledSize };
     } catch (e) {
       this.sellBackoff.set(pos.id, Date.now() + 30_000);
       const msg = e instanceof Error ? e.message : "error";
+      this.liveDiag.lastError = `SELL ${pos.base}: ${msg}`;
+      this.liveDiag.lastErrorAt = Date.now();
       this.log("RISK", `LIVE SELL ${pos.base} FAILED · ${msg} · position still open, retrying in 30s`);
       if (tgEnabledFor("breaker")) tgNotify("breaker", "⚠️ LIVE SELL FAILED", `${pos.base}: ${msg}\nthe position is still open on Coinbase — check it manually`);
       return null;
@@ -1207,6 +1228,10 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       entriesLocked: this.liveEntriesLocked,
       bankroll: this.settings.mode === "live" ? this.settings.balance : null,
       openLive: this.positions.filter((p) => p.live).length,
+      feed: this.universe.find((u) => u.market === "majors")?.source ?? "none yet",
+      diag: this.liveDiag,
+      gate: this.brain.scoreThreshold,
+      running: this.settings.running,
     };
   }
 

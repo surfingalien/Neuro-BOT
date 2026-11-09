@@ -55,6 +55,8 @@ export default function BacktestDialog({ open, onOpenChange, snap, onApplied }: 
   const [useLiveBrain, setUseLiveBrain] = useState(false);
   const [running, setRunning] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [applyMsg, setApplyMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [confirmLive, setConfirmLive] = useState(false);
   const [error, setError] = useState("");
   const [report, setReport] = useState<BacktestReport | null>(null);
 
@@ -78,14 +80,33 @@ export default function BacktestDialog({ open, onOpenChange, snap, onApplied }: 
   };
 
   const apply = async () => {
+    // real money: make the operator confirm before a brain changes live sizing / gate
+    if (snap.mode === "live" && !confirmLive) {
+      setConfirmLive(true);
+      return;
+    }
     setApplying(true);
+    setApplyMsg(null);
     try {
-      await fetch("/api/backtest", {
+      const res = await fetch("/api/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "apply" }),
       });
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        setApplyMsg({ ok: false, text: j.error ?? `apply failed (${res.status})` });
+      } else {
+        const b = report?.brainAfter;
+        setApplyMsg({
+          ok: true,
+          text: `Brain applied to the ${snap.mode === "live" ? "LIVE" : "paper"} bot${b ? ` · score gate ${b.scoreThreshold} · size ×${b.sizeMultiplier.toFixed(2)}` : ""}. Takes effect on the next trade.`,
+        });
+      }
+      setConfirmLive(false);
       onApplied();
+    } catch {
+      setApplyMsg({ ok: false, text: "network error — the brain was not applied, retry" });
     } finally {
       setApplying(false);
     }
@@ -274,6 +295,26 @@ export default function BacktestDialog({ open, onOpenChange, snap, onApplied }: 
             </div>
 
             {/* apply */}
+            {r.simulated && (
+              <p className="text-[10px] text-amber-300/90 leading-snug">
+                This replay used simulated prices (SIM DATA), so what the brain learned is not from the real market.
+                {snap.mode === "live" ? " The server will refuse to apply it while LIVE." : " Prefer a MAJORS-only run on real data before applying."}
+              </p>
+            )}
+            {snap.mode === "live" && !r.simulated && r.scope !== "majors" && (
+              <p className="text-[10px] text-amber-300/90 leading-snug">
+                This replay includes synthetic memecoin paths. While LIVE only a MAJORS-only replay can be applied.
+              </p>
+            )}
+            {confirmLive && (
+              <p className="text-[10px] text-rose-300 leading-snug">
+                The bot is LIVE with real money. Applying changes its score gate to {r.brainAfter.scoreThreshold} and order size to ×
+                {r.brainAfter.sizeMultiplier.toFixed(2)}. Press the button again to confirm.
+              </p>
+            )}
+            {applyMsg && (
+              <p className={`text-[10.5px] leading-snug ${applyMsg.ok ? "text-emerald-400" : "text-rose-400"}`}>{applyMsg.text}</p>
+            )}
             <div className="flex items-center justify-between gap-3 pt-1">
               <span className="text-[9px] text-slate-600">
                 applying imports weights · score gate · size multiplier · signal weights · per-strategy params into the live bot
@@ -283,7 +324,7 @@ export default function BacktestDialog({ open, onOpenChange, snap, onApplied }: 
                 disabled={applying}
                 className="rounded-lg bg-emerald-600/80 hover:bg-emerald-600 px-4 py-2 text-[11px] font-semibold tracking-wider text-white transition-colors disabled:opacity-50"
               >
-                {applying ? "APPLYING…" : "🧠 APPLY BRAIN TO LIVE BOT"}
+                {applying ? "APPLYING…" : confirmLive ? "CONFIRM — APPLY TO LIVE" : "🧠 APPLY BRAIN TO LIVE BOT"}
               </button>
             </div>
           </div>
