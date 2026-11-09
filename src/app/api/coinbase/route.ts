@@ -1,11 +1,29 @@
 import { NextResponse } from "next/server";
 import { getEngine } from "@/lib/engine/engine";
-import { cbAccounts, cbConfigured, cbProducts, keyDiagnostics, liveGate, liveLimits } from "@/lib/engine/coinbase";
+import { CbError, cbAccounts, cbConfigured, cbProducts, keyDiagnostics, liveGate, liveLimits } from "@/lib/engine/coinbase";
 
 export const dynamic = "force-dynamic";
 
 // Real Coinbase balance + holdings. Read-only; credentials never leave the server.
 let cache: { at: number; body: unknown } | null = null;
+let ipCache: { at: number; ip: string } | null = null;
+
+/** this server's public outbound IP — what Coinbase sees, and what an IP allowlist is matched against */
+async function outboundIp(): Promise<string> {
+  if (ipCache && Date.now() - ipCache.at < 10 * 60_000) return ipCache.ip;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch("https://api.ipify.org?format=json", { signal: ctrl.signal, cache: "no-store" });
+    clearTimeout(t);
+    const ip = ((await r.json()) as { ip?: string }).ip ?? "";
+    if (/^[0-9a-fA-F.:]{3,45}$/.test(ip)) {
+      ipCache = { at: Date.now(), ip };
+      return ip;
+    }
+  } catch { /* unknown */ }
+  return "";
+}
 
 export async function GET() {
   const engine = await getEngine();
@@ -41,7 +59,16 @@ export async function GET() {
       ].sort((a, b) => b.usdValue - a.usdValue);
       cache = { at: Date.now(), body: { holdings, usd: usd ? usd.available : 0, totalUsd: holdings.reduce((t, h) => t + h.usdValue, 0), fetchedAt: Date.now() } };
     } catch (e) {
-      return NextResponse.json({ ...base, holdings: [], totalUsd: 0, usd: 0, error: e instanceof Error ? e.message : "coinbase error" });
+      const status = e instanceof CbError ? e.status : 0;
+      return NextResponse.json({
+        ...base,
+        holdings: [],
+        totalUsd: 0,
+        usd: 0,
+        error: e instanceof Error ? e.message : "coinbase error",
+        // a 401 is most often an IP allowlist on the key: show the address Coinbase sees
+        outboundIp: status === 401 ? await outboundIp() : undefined,
+      });
     }
   }
   return NextResponse.json({ ...base, ...(cache.body as object) }, { headers: { "Cache-Control": "no-store" } });
