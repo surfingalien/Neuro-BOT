@@ -9,6 +9,7 @@ interface CbInfo {
   liveAllowed: boolean;
   liveProblems: string[];
   limits: { bankrollCap: number; maxOrderUsd: number };
+  keyInfo: { name: string; nameLooksRight: boolean; keyType: string; keyError?: string } | null;
   live: { mode: "paper" | "live"; entriesLocked: boolean; bankroll: number | null; openLive: number };
   holdings: Holding[];
   usd: number;
@@ -85,6 +86,14 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
           </p>
         ) : (
           <>
+            {info.keyInfo && (
+              <p className="text-[9.5px] text-slate-500">
+                key loaded: <span className="text-slate-300">{info.keyInfo.name}</span> · {info.keyInfo.keyType}
+                {!info.keyInfo.nameLooksRight && (
+                  <span className="text-amber-300"> · name should look like organizations/…/apiKeys/…</span>
+                )}
+              </p>
+            )}
             {info.error ? (
               <p className="text-[10.5px] text-rose-400">{info.error}</p>
             ) : (

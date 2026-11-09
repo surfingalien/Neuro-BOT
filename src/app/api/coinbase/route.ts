@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getEngine } from "@/lib/engine/engine";
-import { cbAccounts, cbConfigured, cbProducts, liveGate, liveLimits } from "@/lib/engine/coinbase";
+import { cbAccounts, cbConfigured, cbProducts, keyDiagnostics, liveGate, liveLimits } from "@/lib/engine/coinbase";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +16,7 @@ export async function GET() {
     liveProblems: gate.problems,
     limits: liveLimits(),
     live: engine.liveStatus(),
+    keyInfo: cbConfigured() ? keyDiagnostics() : null,
   };
   if (!base.configured) return NextResponse.json({ ...base, holdings: [], totalUsd: 0, usd: 0 });
 

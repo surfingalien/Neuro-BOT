@@ -41,15 +41,37 @@ function privateKeyObject(): crypto.KeyObject {
     const candidate = pem.includes(`BEGIN ${label}`) ? pem : `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`;
     try {
       const key = crypto.createPrivateKey(candidate);
+      const curve = key.asymmetricKeyType === "ec" ? key.asymmetricKeyDetails?.namedCurve : key.asymmetricKeyType;
+      if (curve !== "prime256v1") {
+        throw new CbError(
+          `COINBASE_API_PRIVATE_KEY is a ${curve ?? "unknown"} key, but Coinbase Advanced Trade needs an ECDSA (P-256) key. Create a new API key and choose ECDSA as the signature algorithm.`
+        );
+      }
       keyCache = { raw, key };
       return key;
     } catch (e) {
+      if (e instanceof CbError) throw e;
       lastErr = e instanceof Error ? e.message : "unknown";
     }
   }
   throw new CbError(
-    `COINBASE_API_PRIVATE_KEY could not be read (${lastErr.split(":").pop()?.trim()}). Paste the whole key from the downloaded file, including the BEGIN/END lines.`
+    `COINBASE_API_PRIVATE_KEY could not be read (${lastErr.split(":").pop()?.trim()}). Paste the whole key from the downloaded file, including the BEGIN/END lines. ` +
+      `(A short single-line base64 secret means an Ed25519 key, which doesn't work here: create the key with ECDSA.)`
   );
+}
+
+/** what the server loaded — safe to show: masked key name + key type, never the secret */
+export function keyDiagnostics(): { name: string; nameLooksRight: boolean; keyType: string; keyError?: string } {
+  const n = keyName();
+  const m = n.match(/^organizations\/([^/]+)\/apiKeys\/([^/]+)$/);
+  const id = m?.[2] ?? "";
+  const name = m ? `organizations/…/apiKeys/${id.slice(0, 4)}…${id.slice(-4)}` : n ? `${n.slice(0, 6)}… (${n.length} chars)` : "(not set)";
+  try {
+    privateKeyObject();
+    return { name, nameLooksRight: !!m, keyType: "ECDSA P-256 ✓" };
+  } catch (e) {
+    return { name, nameLooksRight: !!m, keyType: "unreadable", keyError: e instanceof Error ? e.message : "error" };
+  }
 }
 
 export const cbConfigured = () => keyName().length > 0 && rawPrivateKey().trim().length > 0;
@@ -113,7 +135,13 @@ async function request<T>(
     try { json = text ? JSON.parse(text) : null; } catch { /* non-json */ }
     if (!res.ok) {
       const j = json as { message?: string; error?: string } | null;
-      throw new CbError(`coinbase ${res.status}: ${j?.message ?? j?.error ?? text.slice(0, 120)}`, res.status);
+      const hint =
+        res.status === 401 && o.auth
+          ? " — Coinbase rejected the key. Check: (1) COINBASE_API_KEY_NAME is the FULL name from the key file (organizations/…/apiKeys/…), not just the short ID; (2) the name and private key come from the same key; (3) the key has NO IP allowlist (Railway's IP changes); (4) the key was created as ECDSA."
+          : res.status === 403 && o.auth
+            ? " — the key is valid but lacks permission: enable View (and Trade) on the key."
+            : "";
+      throw new CbError(`coinbase ${res.status}: ${j?.message ?? j?.error ?? text.slice(0, 120)}${hint}`, res.status);
     }
     return json as T;
   } catch (e) {
