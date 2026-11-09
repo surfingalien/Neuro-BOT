@@ -59,12 +59,13 @@ export function checkEntrySignal(
 /** STRATEGIST: pick strategy given regime + brain weights (softmax, regime-fit bonus, ε-greedy exploration) */
 export function pickStrategy(
   regime: "trending_up" | "trending_down" | "ranging",
-  weights: Record<StrategyId, number>
+  weights: Record<StrategyId, number>,
+  explore = true // false in LIVE mode: no random strategy samples with real money
 ): StrategyDecision {
   const all: StrategyId[] = ["momentum", "meanrev", "breakout"];
   // ε-greedy exploration: 8% of entries sample any strategy so the brain
   // keeps collecting outcome data — no strategy goes unlearned
-  if (Math.random() < 0.08) {
+  if (explore && Math.random() < 0.08) {
     const explore = all[Math.floor(Math.random() * all.length)];
     return {
       strategy: explore,

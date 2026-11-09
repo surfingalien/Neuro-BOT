@@ -9,6 +9,15 @@ interface CbInfo {
   liveAllowed: boolean;
   liveProblems: string[];
   limits: { bankrollCap: number; maxOrderUsd: number };
+  validation: {
+    ok: boolean;
+    skipped: boolean;
+    reason: string;
+    record: {
+      ranAt: number; passed: boolean; net: number; gross: number; firstHalf: number; secondHalf: number;
+      trades: number; winRate: number; maxDD: number; days: number; feeRate: number; simulated: boolean; reasons: string[];
+    } | null;
+  };
   keyInfo: { name: string; nameLooksRight: boolean; keyType: string; keyError?: string } | null;
   live: {
     mode: "paper" | "live";
@@ -46,6 +55,8 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [execs, setExecs] = useState<Exec[]>([]);
+  const [validating, setValidating] = useState(false);
+  const [valMsg, setValMsg] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -84,6 +95,25 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
       void load();
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runValidation = async () => {
+    setValidating(true);
+    setValMsg("");
+    try {
+      const r = await fetch("/api/backtest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "validate" }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) setValMsg(j.error ?? `validation failed (${r.status})`);
+      void load();
+    } catch {
+      setValMsg("network error — retry");
+    } finally {
+      setValidating(false);
     }
   };
 
@@ -234,6 +264,47 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
               </div>
             )}
 
+            {!isLive && (
+              <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3 flex flex-col gap-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[9px] tracking-widest text-slate-600 uppercase">strategy validation · required before live</span>
+                  <span
+                    className={`text-[9px] tracking-wider rounded-full px-2 py-0.5 border ${
+                      info.validation.ok
+                        ? "border-emerald-500/40 text-emerald-300"
+                        : info.validation.record && !info.validation.record.passed
+                          ? "border-rose-500/50 text-rose-300"
+                          : "border-amber-500/40 text-amber-300"
+                    }`}
+                  >
+                    {info.validation.skipped ? "SKIPPED (override)" : info.validation.ok ? "PASSED" : info.validation.record?.passed === false ? "FAILED" : "NOT RUN"}
+                  </span>
+                </div>
+                {info.validation.record && (
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    last run {ago(info.validation.record.ranAt)} · {info.validation.record.days.toFixed(1)} days of real Coinbase data · fees{" "}
+                    {(info.validation.record.feeRate * 100).toFixed(1)}%/side · {info.validation.record.trades} trades · win{" "}
+                    {info.validation.record.winRate.toFixed(0)}% · before fees{" "}
+                    <b>{info.validation.record.gross >= 0 ? "+" : ""}{info.validation.record.gross.toFixed(1)}%</b> · after fees{" "}
+                    <b className={info.validation.record.net >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                      {info.validation.record.net >= 0 ? "+" : ""}{info.validation.record.net.toFixed(1)}%
+                    </b>
+                  </p>
+                )}
+                {!info.validation.ok && <p className="text-[10px] text-amber-300/90 leading-snug">{info.validation.reason}</p>}
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    disabled={validating}
+                    onClick={() => void runValidation()}
+                    className="border border-violet-500/40 text-violet-300 rounded-lg px-3 py-1.5 text-[10px] hover:bg-violet-500/10 disabled:opacity-50"
+                  >
+                    {validating ? "VALIDATING… (about a minute)" : "RUN VALIDATION"}
+                  </button>
+                  {valMsg && <span className="text-[10px] text-rose-400">{valMsg}</span>}
+                </div>
+              </div>
+            )}
+
             <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
               {!info.liveAllowed && !isLive ? (
                 <p className="text-[10px] text-amber-300/90 leading-snug">
@@ -280,7 +351,7 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                       className="flex-1 min-w-[160px] bg-slate-900/80 border border-slate-700 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500/60"
                     />
                     <button
-                      disabled={busy || confirm.trim() !== "ENABLE LIVE"}
+                      disabled={busy || confirm.trim() !== "ENABLE LIVE" || !info.validation.ok}
                       onClick={() => void act("liveOn")}
                       className="border border-rose-500/50 text-rose-300 rounded-lg px-3 py-1.5 text-[10px] hover:bg-rose-500/10 disabled:opacity-40"
                     >

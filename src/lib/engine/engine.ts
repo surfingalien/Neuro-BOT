@@ -12,6 +12,7 @@ import {
   type BrainCore,
 } from "./brain";
 import { cbAccounts, cbMarketOrder, cbConfigured, cbProducts, liveGate, liveLimits, toProductId } from "./coinbase";
+import { runBacktest } from "./backtest";
 import { dataSourceBadge, fetchKlines, fetchMajors, fetchMemecoins } from "./market";
 import { computeTargets, runAnalyst, runFilter } from "./rules";
 import { checkEntrySignal, pickStrategy } from "./strategies";
@@ -60,6 +61,23 @@ interface Settings {
   weeklyProfitTargetPct: number;
   weeklyLossCapPct: number;
 }
+
+export interface ValidationRecord {
+  ranAt: number;
+  passed: boolean;
+  net: number; // net P&L %, after fees
+  gross: number; // % before fees
+  firstHalf: number; // net % of the first half of the window
+  secondHalf: number;
+  trades: number;
+  winRate: number;
+  maxDD: number;
+  days: number;
+  feeRate: number;
+  simulated: boolean;
+  reasons: string[];
+}
+const VALIDATION_MAX_AGE_MS = 3 * 86_400_000; // a pass goes stale: markets change
 
 class Engine {
   version = ENGINE_VERSION;
@@ -117,6 +135,7 @@ class Engine {
   paperStartBalance = 1000;
   liveEntriesLocked = false; // booted into live with open positions: manage exits, no new entries until re-confirmed
   sellBackoff = new Map<string, number>(); // position id → earliest next sell attempt
+  validation: ValidationRecord | null = null; // last real-data, after-fees check of the active strategy
   liveDiag = { lastSkip: "", lastSkipAt: 0, lastError: "", lastErrorAt: 0, buys: 0, sells: 0, lastOrderAt: 0 };
 
   /** why a live entry was NOT placed — logged at most once per reason per 5 minutes so the log stays readable */
@@ -200,6 +219,9 @@ class Engine {
       this.dayKey = s.dayKey;
       this.dayPnl = s.dayPnl;
       this.paperBalance = s.paperBalance;
+      try {
+        if (s.validationJson) this.validation = JSON.parse(s.validationJson) as ValidationRecord;
+      } catch { /* none */ }
       this.paperStartBalance = s.mode === "live" ? s.paperBalance : s.startBalance;
       this.dayStartBalance = s.dayStartBalance || s.balance;
       this.weekKey = s.weekKey;
@@ -310,6 +332,7 @@ class Engine {
           startBalance: this.settings.startBalance,
           balance: this.settings.balance,
           paperBalance: this.paperBalance,
+          validationJson: this.validation ? JSON.stringify(this.validation) : "",
           maxPositionPct: this.settings.maxPositionPct,
           stopLossPct: this.settings.stopLossPct,
           tp1Pct: this.settings.tp1Pct,
@@ -659,7 +682,7 @@ balance ${fmtUsd(this.settings.balance)}`);
 
     // ─── STRATEGIST (inside executor handoff) ───
     this.phase = "DECIDING";
-    const decision = pickStrategy(this.regime, this.brain.weights);
+    const decision = pickStrategy(this.regime, this.brain.weights, this.settings.mode !== "live");
     const sig = checkEntrySignal(decision.strategy, k);
     if (!sig.ok) {
       this.log("INFO", `${pair.base} ${decision.strategy} signal not ready · ${sig.detail}`);
@@ -1185,6 +1208,8 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
     const gate = liveGate();
     if (!gate.ok) return { ok: false, error: gate.problems.join("; ") };
     if (confirm.trim() !== "ENABLE LIVE") return { ok: false, error: "type ENABLE LIVE to confirm" };
+    const v = this.validationStatus();
+    if (!v.ok) return { ok: false, error: v.reason };
 
     if (this.settings.mode === "live") {
       // already live (e.g. restarted with open positions): confirming just unlocks new entries
@@ -1232,6 +1257,52 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
     this.log("RISK", "LIVE trading disabled · back to paper · no live positions open");
     await this.persistSettings();
     return { ok: true };
+  }
+
+  /** live trading needs a recent real-data, after-fees pass of the ACTIVE strategy (override: LIVE_SKIP_VALIDATION=true) */
+  validationStatus(): { ok: boolean; skipped: boolean; reason: string; record: ValidationRecord | null } {
+    const record = this.validation;
+    if (process.env.LIVE_SKIP_VALIDATION === "true") return { ok: true, skipped: true, reason: "", record };
+    if (!record) return { ok: false, skipped: false, reason: "live is locked: this strategy has not been validated. Run the validation (Coinbase panel) — it must show a profit after fees on real data.", record };
+    const age = Date.now() - record.ranAt;
+    if (age > VALIDATION_MAX_AGE_MS) return { ok: false, skipped: false, reason: "live is locked: the last validation is older than 3 days — run it again.", record };
+    if (!record.passed) return { ok: false, skipped: false, reason: `live is locked: the strategy FAILED validation (net ${record.net.toFixed(1)}% after fees over ${record.days.toFixed(0)} days: ${record.reasons.join("; ")}).`, record };
+    return { ok: true, skipped: false, reason: "", record };
+  }
+
+  /** replay the active strategy over ~7 days of REAL Coinbase candles with realistic fees and judge it */
+  async runValidation(): Promise<ValidationRecord> {
+    const feeRate = 0.006;
+    const r = await runBacktest({ scope: "majors", bars: 10000, useLiveBrain: false, startBalance: 1000, feeRate }, null);
+    const eq = r.equityCurve.map((p) => p.eq);
+    const mid = eq[Math.floor(eq.length / 2)] ?? r.startBalance;
+    const first = ((mid - r.startBalance) / r.startBalance) * 100;
+    const second = ((r.endEquity - mid) / Math.max(1, mid)) * 100;
+    const reasons: string[] = [];
+    if (r.simulated) reasons.push("replay used simulated prices");
+    if (r.pnlPct <= 0) reasons.push(`net result is not positive`);
+    if (r.trades < 20) reasons.push(`only ${r.trades} trades (needs 20+)`);
+    if (second < 0) reasons.push("the second half of the window lost money");
+    if (r.maxDrawdownPct > 10) reasons.push(`max drawdown ${r.maxDrawdownPct.toFixed(1)}% (limit 10%)`);
+    const rec: ValidationRecord = {
+      ranAt: Date.now(),
+      passed: reasons.length === 0,
+      net: r.pnlPct,
+      gross: ((r.pnl + r.feesPaid) / r.startBalance) * 100,
+      firstHalf: first,
+      secondHalf: second,
+      trades: r.trades,
+      winRate: r.winRate,
+      maxDD: r.maxDrawdownPct,
+      days: r.spanHours / 24,
+      feeRate,
+      simulated: r.simulated,
+      reasons,
+    };
+    this.validation = rec;
+    this.log(rec.passed ? "INFO" : "RISK", `validation ${rec.passed ? "PASSED" : "FAILED"} · ${rec.days.toFixed(1)}d real data · net ${rec.net.toFixed(1)}% after ${(feeRate * 100).toFixed(1)}%/side fees · ${rec.trades} trades${rec.passed ? "" : " · " + rec.reasons.join("; ")}`);
+    await this.persistSettings();
+    return rec;
   }
 
   liveStatus() {

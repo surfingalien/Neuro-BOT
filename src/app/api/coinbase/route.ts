@@ -34,6 +34,7 @@ export async function GET() {
     liveProblems: gate.problems,
     limits: liveLimits(),
     live: engine.liveStatus(),
+    validation: engine.validationStatus(),
     keyInfo: cbConfigured() ? keyDiagnostics() : null,
   };
   if (!base.configured) return NextResponse.json({ ...base, holdings: [], totalUsd: 0, usd: 0 });
