@@ -209,9 +209,9 @@ export async function cbProducts(ids: string[], maxAgeMs = 12_000): Promise<CbPr
 
 export interface CbCandle { t: number; o: number; h: number; l: number; c: number; v: number }
 
-export async function cbCandles(id: string, granularity: "ONE_MINUTE" | "ONE_HOUR", count: number): Promise<CbCandle[]> {
+export async function cbCandles(id: string, granularity: "ONE_MINUTE" | "ONE_HOUR", count: number, endSec?: number): Promise<CbCandle[]> {
   const step = granularity === "ONE_MINUTE" ? 60 : 3600;
-  const end = Math.floor(Date.now() / 1000);
+  const end = endSec ?? Math.floor(Date.now() / 1000);
   const res = await request<{ candles?: { start: string; low: string; high: string; open: string; close: string; volume: string }[] }>(
     "GET",
     `/api/v3/brokerage/market/products/${id}/candles`,

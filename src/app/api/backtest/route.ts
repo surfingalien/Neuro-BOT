@@ -27,7 +27,18 @@ export async function POST(req: Request) {
 
   if (body.action === "apply") {
     const rep = lastReport();
-    if (!rep) return NextResponse.json({ error: "no backtest result yet — run one first" }, { status: 400 });
+    if (!rep) {
+      return NextResponse.json({ error: "no backtest result is stored on the server (it restarted since you ran it) — run the backtest again, then apply" }, { status: 400 });
+    }
+    // real money: never steer the live bot with a brain trained on made-up prices
+    if (engine.settings.mode === "live" && (rep.simulated || rep.scope !== "majors")) {
+      return NextResponse.json(
+        {
+          error: `refused in LIVE mode: this replay used ${rep.simulated ? "simulated" : "synthetic memecoin"} data. Run a MAJORS-only backtest on real Coinbase candles, or switch to paper first.`,
+        },
+        { status: 409 }
+      );
+    }
     await engine.importBrain(rep.brainAfter, `backtest ${rep.id} (${rep.trades} trades · ${rep.winRate.toFixed(0)}% win)`);
     return NextResponse.json({ ok: true, applied: true, snapshot: engine.snapshot() });
   }

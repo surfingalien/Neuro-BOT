@@ -3,9 +3,11 @@ import { db } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(req: Request) {
+  const liveOnly = new URL(req.url).searchParams.get("mode") === "live";
   try {
     const trades = await db.trade.findMany({
+      where: liveOnly ? { mode: "live" } : undefined,
       orderBy: { openedAt: "desc" },
       take: 100,
     });
@@ -18,6 +20,7 @@ export async function GET() {
         symbol: t.symbol,
         base: t.name,
         market: t.market,
+        mode: t.mode,
         strategy: t.strategy,
         entryPrice: t.entryPrice,
         exitPrice: t.exitPrice,

@@ -15,6 +15,7 @@ import {
 import { computeTargets, runAnalyst, runFilter } from "./rules";
 import { checkEntrySignal, pickStrategy } from "./strategies";
 import { MAJOR_SYMBOLS } from "./market";
+import { cbCandles, toProductId } from "./coinbase";
 import { fetchMemecoins } from "./market";
 import type { Candle, Klines, MarketFocus, ScoutPair, StrategyId } from "./types";
 import { clamp } from "./indicators";
@@ -109,6 +110,26 @@ const SIM_PRICE_ANCHORS: Record<string, number> = {
   DOGEUSDT: 0.16, ADAUSDT: 0.52, LINKUSDT: 13.4, AVAXUSDT: 18.2, SUIUSDT: 2.1,
 };
 
+/** real 1m candles from Coinbase, paged backwards 300 at a time (public endpoint, no key) */
+async function coinbase1m(symbol: string, bars: number): Promise<Candle[]> {
+  const id = toProductId(symbol);
+  let all: Candle[] = [];
+  let end = Math.floor(Date.now() / 1000);
+  try {
+    while (all.length < bars) {
+      const n = Math.min(300, bars - all.length);
+      const page = await cbCandles(id, "ONE_MINUTE", n, end);
+      if (page.length === 0) break;
+      all = [...page, ...all];
+      end = Math.floor(page[0].t / 1000) - 1;
+      if (page.length < n * 0.5) break;
+    }
+  } catch {
+    /* fall through with what we have */
+  }
+  return all;
+}
+
 async function binance1m(symbol: string, bars: number): Promise<Candle[]> {
   const out: Candle[] = [];
   let endTime = 0;
@@ -174,7 +195,14 @@ async function loadSymbolData(
 
   if (scope === "majors" || scope === "both") {
     const syms = (scope === "majors" ? MAJOR_SYMBOLS : MAJOR_SYMBOLS.slice(0, 4)) as readonly string[];
-    const pages = await Promise.all(syms.map((s) => binance1m(s, bars)));
+    // real Coinbase candles first (Binance blocks US hosts); 3 symbols at a time to respect the public rate limit
+    const pages: Candle[][] = [];
+    for (let i = 0; i < syms.length; i += 3) {
+      pages.push(...(await Promise.all(syms.slice(i, i + 3).map(async (s) => {
+        const cb = await coinbase1m(s, bars);
+        return cb.length >= 200 ? cb : binance1m(s, bars);
+      }))));
+    }
     syms.forEach((s, idx) => {
       const candles = pages[idx];
       if (candles.length >= 200) {
@@ -239,7 +267,7 @@ function majorsPair(symbol: string, candles: Candle[], i: number): ScoutPair {
     txns1h: Math.round(vol24 / 8000),
     buys1h: Math.round(vol24 / 16000),
     sells1h: Math.round(vol24 / 16000),
-    source: "backtest",
+    source: "coinbase", // same filter thresholds as the live feed
   };
 }
 
