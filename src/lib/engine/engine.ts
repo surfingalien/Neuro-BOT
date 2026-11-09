@@ -31,6 +31,12 @@ import { TG_DEFAULT_EVENTS, tgConfigure, tgConfig, tgEnabledFor, tgNotify, type 
 import type { BrainView } from "./backtest";
 
 const TICK_MS = 3000;
+/** exchange fee per side charged in PAPER mode (live pays the real fee). Majors ≈ Coinbase taker at low volume tiers.
+ *  Override with PAPER_FEE_PCT (e.g. 0.25). Paper used to charge none, which made results look far better than live. */
+const paperFee = (market: "majors" | "memecoin"): number => {
+  const v = parseFloat(process.env.PAPER_FEE_PCT ?? "");
+  return isFinite(v) && v >= 0 ? Math.min(2, v) / 100 : market === "majors" ? 0.006 : 0.003;
+};
 const ENGINE_VERSION = 10; // bump to force engine rebuild on code change (dev HMR)
 
 interface Settings {
@@ -842,7 +848,7 @@ balance ${fmtUsd(this.settings.balance)}`);
 
     if (!pos.tp1Booked && px >= pos.tp1) {
       // book half at TP1, arm trailing on the runner
-      let booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2;
+      let booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 - pos.tp1 * (pos.qty / 2) * paperFee(pos.market);
       if (pos.live) {
         // real partial sell; if it can't be placed, trail the whole position instead of retrying every tick
         const held = pos.heldQty ?? pos.qty;
@@ -911,8 +917,14 @@ balance ${fmtUsd(this.settings.balance)}`);
       realizedLive = r.netUsd - pos.entryPrice * r.soldQty + (pos.bankedPnl ?? 0);
     }
     const remainingQty = pos.qty * (pos.tp1Booked ? 0.5 : 1);
-    const banked = pos.live ? pos.bankedPnl ?? 0 : pos.tp1Booked ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 : 0;
-    const realized = realizedLive ?? (px - pos.entryPrice) * remainingQty + banked;
+    const fee = paperFee(pos.market);
+    const banked = pos.live
+      ? pos.bankedPnl ?? 0
+      : pos.tp1Booked
+        ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 - pos.tp1 * (pos.qty / 2) * fee
+        : 0;
+    // paper: charge the entry fee + the exit fee on what is still open (live realized comes from real fills, fees included)
+    const realized = realizedLive ?? (px - pos.entryPrice) * remainingQty - pos.sizeUsd * fee - px * remainingQty * fee + banked;
     const pnlPct = ((px - pos.entryPrice) / pos.entryPrice) * 100;
     const plannedRiskPct = Math.abs(((pos.stopLoss - pos.entryPrice) / pos.entryPrice) * 100) || 8;
     const reward = clamp((reason === "stop" ? -plannedRiskPct : pnlPct) / plannedRiskPct, -1, 1);

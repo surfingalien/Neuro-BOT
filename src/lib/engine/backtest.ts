@@ -24,6 +24,7 @@ export interface BacktestParams {
   scope: MarketFocus; // majors | memecoins | both
   bars: number; // 1m bars per symbol, 300..3000
   useLiveBrain: boolean; // start from the live brain snapshot instead of fresh
+  feeRate?: number; // exchange fee per side as a fraction (0.006 = 0.6%); default: realistic Coinbase taker fee for majors
   startBalance: number;
 }
 
@@ -64,6 +65,9 @@ export interface BacktestReport {
   brainAfter: BrainView;
   lessons: string[];
   log: string[];
+  feeRate: number;
+  feesPaid: number; // total fees charged in the replay (already inside pnl)
+  byReason: Record<string, { n: number; pnl: number }>;
 }
 
 interface BtPosition {
@@ -110,24 +114,49 @@ const SIM_PRICE_ANCHORS: Record<string, number> = {
   DOGEUSDT: 0.16, ADAUSDT: 0.52, LINKUSDT: 13.4, AVAXUSDT: 18.2, SUIUSDT: 2.1,
 };
 
-/** real 1m candles from Coinbase, paged backwards 300 at a time (public endpoint, no key) */
+/** real 1m candles from Coinbase, paged backwards 300 at a time (public endpoint, no key).
+ *  Retries rate-limit errors, and returns a COMPLETE minute grid: Coinbase omits minutes with no trades,
+ *  so gaps are forward-filled (flat candle, zero volume). That keeps every symbol's index i = the same minute. */
 async function coinbase1m(symbol: string, bars: number): Promise<Candle[]> {
   const id = toProductId(symbol);
-  let all: Candle[] = [];
+  const byMinute = new Map<number, Candle>();
   let end = Math.floor(Date.now() / 1000);
+  let minutes = 0;
   try {
-    while (all.length < bars) {
-      const n = Math.min(300, bars - all.length);
-      const page = await cbCandles(id, "ONE_MINUTE", n, end);
-      if (page.length === 0) break;
-      all = [...page, ...all];
-      end = Math.floor(page[0].t / 1000) - 1;
-      if (page.length < n * 0.5) break;
+    while (minutes < bars) {
+      const n = Math.min(300, bars - minutes);
+      let page: Candle[] = [];
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          page = await cbCandles(id, "ONE_MINUTE", n, end);
+          break;
+        } catch (e) {
+          if (attempt === 3) throw e;
+          await new Promise((r) => setTimeout(r, 500 * 2 ** attempt)); // 0.5s, 1s, 2s
+        }
+      }
+      for (const c of page) byMinute.set(Math.floor(c.t / 60000), c);
+      minutes += n; // the window advances by n minutes whether or not every minute traded
+      end -= n * 60;
+      await new Promise((r) => setTimeout(r, 120)); // stay well under the public rate limit
     }
   } catch {
-    /* fall through with what we have */
+    /* use what we have */
   }
-  return all;
+  if (byMinute.size === 0) return [];
+  const keys = [...byMinute.keys()].sort((a, b) => a - b);
+  const out: Candle[] = [];
+  let prev = byMinute.get(keys[0])!;
+  for (let m = keys[0]; m <= keys[keys.length - 1]; m++) {
+    const c = byMinute.get(m);
+    if (c) {
+      out.push(c);
+      prev = c;
+    } else {
+      out.push({ t: m * 60000, o: prev.c, h: prev.c, l: prev.c, c: prev.c, v: 0 }); // no trades this minute
+    }
+  }
+  return out;
 }
 
 async function binance1m(symbol: string, bars: number): Promise<Candle[]> {
@@ -195,10 +224,10 @@ async function loadSymbolData(
 
   if (scope === "majors" || scope === "both") {
     const syms = (scope === "majors" ? MAJOR_SYMBOLS : MAJOR_SYMBOLS.slice(0, 4)) as readonly string[];
-    // real Coinbase candles first (Binance blocks US hosts); 3 symbols at a time to respect the public rate limit
+    // real Coinbase candles first (Binance blocks US hosts); 2 symbols at a time to respect the public rate limit
     const pages: Candle[][] = [];
-    for (let i = 0; i < syms.length; i += 3) {
-      pages.push(...(await Promise.all(syms.slice(i, i + 3).map(async (s) => {
+    for (let i = 0; i < syms.length; i += 2) {
+      pages.push(...(await Promise.all(syms.slice(i, i + 2).map(async (s) => {
         const cb = await coinbase1m(s, bars);
         return cb.length >= 200 ? cb : binance1m(s, bars);
       }))));
@@ -213,6 +242,14 @@ async function loadSymbolData(
         out.push({ symbol: s, base: s.replace("USDT", ""), name: s, market: "majors", candles: synthCandles(anchor, bars, 0.0016, 77 + idx), liq: 0, mcapMult: 1, avgTxn: 0, simulatedAll: true });
       }
     });
+  }
+
+  // align every real majors grid to the common time window so candle index i is the same minute everywhere
+  const realMajors = out.filter((o) => o.market === "majors" && !o.simulatedAll && o.candles.length > 0);
+  if (realMajors.length > 1) {
+    const t0 = Math.max(...realMajors.map((o) => o.candles[0].t));
+    const t1 = Math.min(...realMajors.map((o) => o.candles[o.candles.length - 1].t));
+    for (const o of realMajors) o.candles = o.candles.filter((c) => c.t >= t0 && c.t <= t1);
   }
 
   if (scope === "memecoins" || scope === "both") {
@@ -351,7 +388,7 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
   if (st.running) throw new Error("backtest already running");
   st.running = true;
   try {
-    const bars = Math.round(Math.max(300, Math.min(3000, params.bars || 1000)));
+    const bars = Math.round(Math.max(300, Math.min(10000, params.bars || 1000)));
     const scope = params.scope || "majors";
     const startBalance = Math.max(100, Math.min(1_000_000, params.startBalance || 1000));
 
@@ -364,6 +401,10 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
     const minLen = Math.min(...data.map((d) => d.candles.length));
     if (minLen < WARMUP + 60) throw new Error("not enough history fetched");
 
+    // fees: paper/backtest used to charge only 0.04% slippage; Coinbase market orders cost ~0.6%/side at low volume tiers
+    const feeRate = typeof params.feeRate === "number" && params.feeRate >= 0 ? Math.min(0.02, params.feeRate) : scope === "memecoins" ? 0.003 : 0.006;
+    let feesPaid = 0;
+    const byReason: Record<string, { n: number; pnl: number }> = {};
     let balance = startBalance;
     const positions: BtPosition[] = [];
     const eqCurve: { i: number; eq: number }[] = [];
@@ -428,7 +469,9 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
         }
         // TP1 book-half + arm trail
         if (!pos.tp1Booked && c.h >= pos.tp1) {
-          const booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2;
+          const halfFee = pos.tp1 * (pos.qty / 2) * feeRate;
+          feesPaid += halfFee;
+          const booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 - halfFee;
           balance += booked;
           pos.tp1Booked = true;
           pos.trailActive = true;
@@ -565,6 +608,9 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
       brainAfter: brainView(brain),
       lessons: [...brain.lessons],
       log: logLines,
+      feeRate,
+      feesPaid,
+      byReason,
     };
     st.last = report;
     return report;
@@ -579,11 +625,17 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
       const idx = positions.indexOf(pos);
       if (idx >= 0) positions.splice(idx, 1);
       const remainingQty = pos.qty * (pos.tp1Booked ? 0.5 : 1);
-      const realized = (px - pos.entryPrice) * remainingQty + (pos.tp1Booked ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 : 0);
+      const entryFee = pos.sizeUsd * feeRate;
+      const exitFee = px * remainingQty * feeRate;
+      const bankedNet = pos.tp1Booked ? ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 - pos.tp1 * (pos.qty / 2) * feeRate : 0;
+      const realized = (px - pos.entryPrice) * remainingQty - exitFee - entryFee + bankedNet;
+      feesPaid += entryFee + exitFee;
       const pnlPct = ((px - pos.entryPrice) / pos.entryPrice) * 100;
       const plannedRiskPct = Math.abs(((pos.stopLoss - pos.entryPrice) / pos.entryPrice) * 100) || 8;
       const reward = clamp((reason === "stop" ? -plannedRiskPct : pnlPct) / plannedRiskPct, -1, 1);
-      balance += realized;
+      balance += realized - bankedNet; // the TP1 half was already added to balance when it booked
+      (byReason[reason] ??= { n: 0, pnl: 0 }).n += 1;
+      byReason[reason].pnl += realized;
       dayPnl += realized;
       weekPnl += realized;
       trades += 1;
