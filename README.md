@@ -122,6 +122,29 @@ a non-losing second half and max drawdown <= 10%. A pass expires after 3 days. I
 Other related settings: `PAPER_FEE_PCT` (paper-mode fee per side, default 0.6 for majors) and, in live mode, the bot no
 longer takes random "exploration" strategy samples.
 
+## The autonomous desk (self-improving research loop)
+
+The dashboard's **Desk** panel is a background loop that researches, re-tunes and judges strategies on its own. It
+**never places orders**. In production it starts by itself (`DESK_AUTORUN=false` turns it off; `true` forces it on).
+
+Every 24 hours it:
+1. re-downloads ~1 year of real hourly Coinbase candles,
+2. runs a fee-aware **walk-forward** on each strategy family (weekly momentum rotation, 1h trend breakout, 1h uptrend
+   pullback), judged only on windows the parameters were not chosen on,
+3. **re-tunes** each family on the latest 120 days and adopts the new parameters only if they beat the current ones by 1%
+   and the current version is 14+ days old (it improves without thrashing),
+4. keeps every adopted version under a **forward test**: replayed on bars that did not exist when its parameters were
+   chosen, with real fees (it starts at "not started yet" and grows hour by hour),
+5. **promotes** a family only when the walk-forward passed AND the forward test is profitable over 28+ days (5+ trades,
+   drawdown <= 15%), and **demotes** it when the walk-forward fails again or the forward test drops below -3%.
+
+Hourly it pulls the newest candles and extends the forward tests. Every decision lands in the on-screen journal, and
+all state is saved to the database, so restarts lose nothing.
+
+Promotion makes a strategy *eligible* for live trading; it does not trade. Real money still requires the live gates
+(validation, `LIVE_TRADING_ENABLED`, `APP_PASSWORD`, typed `ENABLE LIVE`) and the bankroll / per-order caps. A live executor
+for promoted strategies is deliberately not built yet: nothing has earned promotion, so it would only add risk.
+
 ## What's inside
 
 ### 6-agent pipeline (hard handoffs, one job each)

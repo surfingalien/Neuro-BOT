@@ -13,6 +13,7 @@ import {
 } from "./brain";
 import { cbAccounts, cbMarketOrder, cbConfigured, cbProducts, liveGate, liveLimits, toProductId } from "./coinbase";
 import { runBacktest } from "./backtest";
+import { startDesk } from "./desk";
 import { dataSourceBadge, fetchKlines, fetchMajors, fetchMemecoins } from "./market";
 import { computeTargets, runAnalyst, runFilter } from "./rules";
 import { checkEntrySignal, pickStrategy } from "./strategies";
@@ -307,6 +308,7 @@ class Engine {
       }
 
       this.startedAt = Date.now();
+      void startDesk().catch(() => undefined); // autonomous research desk (paper-only background loop)
       this.log("BOOT", `engine booted · mode ${this.settings.mode} · balance $${this.settings.balance.toFixed(2)}`);
       if (this.positions.length) this.log("INFO", `restored ${this.positions.length} open position(s) from db`);
 

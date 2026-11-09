@@ -13,6 +13,7 @@ import TargetPanel from "@/components/terminal/TargetPanel";
 import StatsPanel from "@/components/terminal/StatsPanel";
 import LogPanel from "@/components/terminal/LogPanel";
 import CoinbasePanel from "@/components/terminal/CoinbasePanel";
+import DeskPanel from "@/components/terminal/DeskPanel";
 import SettingsDialog from "@/components/terminal/SettingsDialog";
 import BacktestDialog from "@/components/terminal/BacktestDialog";
 
@@ -153,6 +154,7 @@ export default function Home() {
               <AnalystPanel snap={snap} />
             </div>
             <PositionPanel snap={snap} />
+            <DeskPanel />
             <CoinbasePanel snap={snap} onChanged={() => void poll()} />
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
               <BrainPanel snap={snap} />

@@ -102,3 +102,10 @@ model BrainState {
   closedSinceAutotune Int  @default(0)
   updatedAt       DateTime @updatedAt
 }
+
+// Autonomous research desk state (versions, walk-forward results, forward tests, journal)
+model DeskState {
+  id        String   @id @default("main")
+  json      String   @default("{}")
+  updatedAt DateTime @updatedAt
+}
