@@ -15,6 +15,7 @@ interface CbInfo {
   usd: number;
   totalUsd: number;
   error?: string;
+  outboundIp?: string;
 }
 
 const usd = (n: number) => `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -95,7 +96,16 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
               </p>
             )}
             {info.error ? (
-              <p className="text-[10.5px] text-rose-400">{info.error}</p>
+              <div className="flex flex-col gap-1.5">
+                <p className="text-[10.5px] text-rose-400">{info.error}</p>
+                {info.outboundIp && (
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    This server currently reaches Coinbase from{" "}
+                    <code className="text-slate-200">{info.outboundIp}</code>. If the key has an IP allowlist, this address
+                    must be on it (or remove the allowlist). Railway&apos;s outbound IP can change after a redeploy.
+                  </p>
+                )}
+              </div>
             ) : (
               <>
                 <div className="flex items-baseline gap-4">
