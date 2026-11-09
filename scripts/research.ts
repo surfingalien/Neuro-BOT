@@ -62,8 +62,8 @@ function report(r: WalkForward) {
   for (const [label, fee] of [["Coinbase taker 0.60%/side", 0.006], ["lower tier 0.25%/side", 0.0025]] as const) {
     const cfg: SimCfg = { ...DEFAULT_SIM, feeRate: fee };
     console.log(`\n==================== FEES: ${label} ====================`);
-    report(walkForward("trend-breakout", data, breakoutGrid, breakout, cfg, opts));
-    report(walkForward("uptrend-pullback", data, pullbackGrid, pullback, cfg, opts));
-    report(walkForwardRotation(data, rotGrid, cfg, opts));
+    report(await walkForward("trend-breakout", data, breakoutGrid, breakout, cfg, opts));
+    report(await walkForward("uptrend-pullback", data, pullbackGrid, pullback, cfg, opts));
+    report(await walkForwardRotation(data, rotGrid, cfg, opts));
   }
 })();

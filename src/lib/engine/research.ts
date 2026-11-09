@@ -13,6 +13,8 @@ import { cbCandles, toProductId } from "./coinbase";
 // ───────────────────────── data ─────────────────────────
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** let the event loop breathe between heavy simulations so the dashboard + trading loop never freeze */
+const tick = () => new Promise<void>((r) => setImmediate(r));
 
 /** real hourly candles from Coinbase, paged backwards; gaps (hours with no trades) forward-filled; all coins trimmed to one window */
 export async function loadHourly(symbols: string[], days: number): Promise<Record<string, Candle[]>> {
@@ -178,6 +180,7 @@ export interface SimResult {
   maxDD: number; // fraction
   fees: number;
   equity: number[];
+  holding: string[]; // symbols still open at the end of the window (before the forced exit)
 }
 
 interface Pos { sym: string; qty: number; entry: number; stop: number; trail: number; openedAt: number; cost: number }
@@ -246,6 +249,7 @@ export function simulate(data: Record<string, Ind>, strat: Strat, cfg: SimCfg, f
     }
     equity.push(cash + open.reduce((a, p) => a + p.qty * data[p.sym].c[i].c, 0));
   }
+  const holding = open.map((p) => p.sym);
   for (const p of [...open]) sell(p, data[p.sym].c[to - 1].c, to - 1, "end");
 
   const final = cash;
@@ -264,6 +268,7 @@ export function simulate(data: Record<string, Ind>, strat: Strat, cfg: SimCfg, f
     maxDD,
     fees,
     equity,
+    holding,
   };
 }
 
@@ -323,6 +328,7 @@ export function simulateRotation(
     }
     equity.push(cash + [...held].reduce((a, [s, h]) => a + h.qty * data[s].c[i].c, 0));
   }
+  const holdingNow = target ?? [...held.keys()]; // a rebalance decided on the last bar counts as the current target
   for (const [s, h] of [...held]) {
     const gross = data[s].c[to - 1].c * (1 - cfg.slip) * h.qty;
     const fee = gross * cfg.feeRate;
@@ -338,7 +344,7 @@ export function simulateRotation(
     maxDD = Math.max(maxDD, (peak - e) / peak);
   }
   const wins = trades.filter((t) => t.pnl > 0).length;
-  return { ret: cash / cfg.startEq - 1, grossRet: (cash + fees) / cfg.startEq - 1, trades, winRate: trades.length ? wins / trades.length : 0, maxDD, fees, equity };
+  return { ret: cash / cfg.startEq - 1, grossRet: (cash + fees) / cfg.startEq - 1, trades, winRate: trades.length ? wins / trades.length : 0, maxDD, fees, equity, holding: holdingNow };
 }
 
 /** equal-weight buy-and-hold of every coin over the same window, after fees + slippage */
@@ -423,18 +429,19 @@ export function judge(name: string, windows: WindowResult[]): WalkForward {
 }
 
 /** rolling walk-forward: pick params on `trainBars`, test on the next `testBars`, slide forward by testBars */
-export function walkForward<P extends Record<string, number>>(
+export async function walkForward<P extends Record<string, number>>(
   name: string,
   data: Record<string, Ind>,
   grid: P[],
   build: (p: P) => Strat,
   cfg: SimCfg,
   opts: { warmup: number; trainBars: number; testBars: number; total: number }
-): WalkForward {
+): Promise<WalkForward> {
   const out: WindowResult[] = [];
   for (let t0 = opts.warmup + opts.trainBars; t0 + opts.testBars <= opts.total; t0 += opts.testBars) {
     let best: { p: P; ret: number } | null = null;
     for (const p of grid) {
+      await tick();
       const r = simulate(data, build(p), cfg, t0 - opts.trainBars, t0);
       if (r.trades.length >= 5 && (!best || r.ret > best.ret)) best = { p, ret: r.ret };
     }
@@ -445,16 +452,17 @@ export function walkForward<P extends Record<string, number>>(
   return judge(name, out);
 }
 
-export function walkForwardRotation(
+export async function walkForwardRotation(
   data: Record<string, Ind>,
   grid: { lookback: number; topK: number; every: number; trend: number }[],
   cfg: SimCfg,
   opts: { warmup: number; trainBars: number; testBars: number; total: number }
-): WalkForward {
+): Promise<WalkForward> {
   const out: WindowResult[] = [];
   for (let t0 = opts.warmup + opts.trainBars; t0 + opts.testBars <= opts.total; t0 += opts.testBars) {
     let best: { p: (typeof grid)[number]; ret: number } | null = null;
     for (const p of grid) {
+      await tick();
       const r = simulateRotation(data, p, cfg, t0 - opts.trainBars, t0);
       if (!best || r.ret > best.ret) best = { p, ret: r.ret };
     }
@@ -463,4 +471,72 @@ export function walkForwardRotation(
     out.push({ from: t0, to: t0 + opts.testBars, picked: p, ret: r.ret, grossRet: r.grossRet, bh: buyAndHold(data, cfg, t0, t0 + opts.testBars), trades: r.trades.length, winRate: r.winRate, maxDD: r.maxDD, fees: r.fees });
   }
   return judge("momentum-rotation", out);
+}
+
+// ───────────────────────── helpers for the autonomous desk ─────────────────────────
+
+/** best grid point on one window (used to choose the parameters that go into a forward test) */
+export async function bestOnWindow<P extends Record<string, number>>(
+  data: Record<string, Ind>, grid: P[], build: (p: P) => Strat, cfg: SimCfg, from: number, to: number
+): Promise<{ p: P; ret: number } | null> {
+  let best: { p: P; ret: number } | null = null;
+  for (const p of grid) {
+    await tick();
+    const r = simulate(data, build(p), cfg, from, to);
+    if (r.trades.length >= 5 && (!best || r.ret > best.ret)) best = { p, ret: r.ret };
+  }
+  return best;
+}
+
+export async function bestRotationOnWindow(
+  data: Record<string, Ind>, grid: { lookback: number; topK: number; every: number; trend: number }[], cfg: SimCfg, from: number, to: number
+): Promise<{ p: (typeof grid)[number]; ret: number } | null> {
+  let best: { p: (typeof grid)[number]; ret: number } | null = null;
+  for (const p of grid) {
+    await tick();
+    const r = simulateRotation(data, p, cfg, from, to);
+    if (!best || r.ret > best.ret) best = { p, ret: r.ret };
+  }
+  return best;
+}
+
+/** append the newest hourly candles to cached grids (one request per coin), forward-filling quiet hours */
+export async function appendHourly(grids: Record<string, Candle[]>): Promise<Record<string, Candle[]>> {
+  const out: Record<string, Candle[]> = {};
+  const merged: Record<string, Map<number, Candle>> = {};
+  for (const [sym, g] of Object.entries(grids)) {
+    const m = new Map<number, Candle>();
+    for (const c of g) m.set(Math.floor(c.t / 3_600_000), c);
+    let page: Candle[] = [];
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        page = await cbCandles(toProductId(sym), "ONE_HOUR", 300);
+        break;
+      } catch (e) {
+        if (attempt === 3) throw e;
+        await sleep(500 * 2 ** attempt);
+      }
+    }
+    for (const c of page) m.set(Math.floor(c.t / 3_600_000), c);
+    merged[sym] = m;
+    await sleep(120);
+  }
+  for (const [sym, m] of Object.entries(merged)) {
+    const keys = [...m.keys()].sort((a, b) => a - b);
+    const g: Candle[] = [];
+    let prev = m.get(keys[0])!;
+    for (let h = keys[0]; h <= keys[keys.length - 1]; h++) {
+      const c = m.get(h);
+      if (c) {
+        g.push(c);
+        prev = c;
+      } else g.push({ t: h * 3_600_000, o: prev.c, h: prev.c, l: prev.c, c: prev.c, v: 0 });
+    }
+    out[sym] = g;
+  }
+  const syms = Object.keys(out);
+  const t0 = Math.max(...syms.map((s) => out[s][0].t));
+  const t1 = Math.min(...syms.map((s) => out[s][out[s].length - 1].t));
+  for (const s of syms) out[s] = out[s].filter((c) => c.t >= t0 && c.t <= t1);
+  return out;
 }
