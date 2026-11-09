@@ -32,14 +32,14 @@ export default function HeaderBar({
   return (
     <header className="flex flex-col gap-4">
       {/* top strip */}
-      <div className="flex items-center gap-3 text-[10px] tracking-widest text-slate-600">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-[10px] tracking-widest text-slate-600">
         <div className="flex gap-1.5">
           <span className="h-2.5 w-2.5 rounded-full bg-rose-500/70" />
           <span className="h-2.5 w-2.5 rounded-full bg-amber-400/70" />
           <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/70" />
         </div>
-        <span className="mx-auto">neuro-bot · crypto-desk · six agents · hard handoffs</span>
-        <div className="flex items-center gap-2">
+        <span className="mx-auto hidden md:block">neuro-bot · crypto-desk · six agents · hard handoffs</span>
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2 [&>*]:whitespace-nowrap">
           <button
             onClick={onOpenBacktest}
             className="border border-violet-500/40 rounded-full px-2.5 py-1 text-[10px] text-violet-300 hover:bg-violet-500/10 transition-colors"
