@@ -4,6 +4,10 @@ import { useCallback, useEffect, useState } from "react";
 import type { BotSnapshot } from "@/lib/engine/types";
 
 interface Holding { currency: string; qty: number; hold: number; price: number; usdValue: number }
+interface Funnel {
+  minutes: number; checked: number; killed: number; scored: number; bestScore: number | null; gate: number;
+  passedGate: number; noTrigger: number; feeSkipped: number; locked: number; entered: number; blockedBy: string;
+}
 interface CbInfo {
   configured: boolean;
   liveAllowed: boolean;
@@ -29,6 +33,7 @@ interface CbInfo {
     drawdownPct?: number;
     ddHalted?: boolean;
     maxDrawdownPct?: number;
+    funnel?: Funnel;
     feed: string;
     gate: number;
     running: boolean;
@@ -225,6 +230,34 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                   )}
                 </div>
               </>
+            )}
+
+            {info.live.funnel && (
+              <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3 flex flex-col gap-1.5" data-testid="entry-funnel">
+                <div className="text-[9px] tracking-widest text-slate-600 uppercase">
+                  why no trades? · entry funnel · last {Math.max(1, info.live.funnel.minutes)} min · {isLive ? "live" : "paper"}
+                </div>
+                <div className="text-[10.5px] text-slate-300 flex flex-wrap gap-x-3 gap-y-1">
+                  <span>checked <b>{info.live.funnel.checked}</b></span>
+                  <span>→ passed filter <b>{info.live.funnel.scored}</b></span>
+                  <span>
+                    → scored {info.live.funnel.gate}+ <b>{info.live.funnel.passedGate}</b>
+                    {info.live.funnel.bestScore !== null ? <span className="text-slate-500"> (best {info.live.funnel.bestScore})</span> : null}
+                  </span>
+                  {info.live.funnel.noTrigger > 0 && <span>· no trigger <b>{info.live.funnel.noTrigger}</b></span>}
+                  {info.live.funnel.feeSkipped > 0 && <span>· fee guard <b>{info.live.funnel.feeSkipped}</b></span>}
+                  {info.live.funnel.locked > 0 && <span>· locked <b>{info.live.funnel.locked}</b></span>}
+                  <span>→ entered <b className={info.live.funnel.entered ? "text-emerald-400" : "text-slate-200"}>{info.live.funnel.entered}</b></span>
+                </div>
+                {info.live.funnel.blockedBy && (
+                  <p className="text-[10px] text-amber-300/90 leading-snug">holding back because: {info.live.funnel.blockedBy}</p>
+                )}
+                {!isLive && (
+                  <p className="text-[10px] text-slate-500 leading-snug">
+                    The bot is in PAPER mode — no real orders. A restart or redeploy always comes back in paper; type ENABLE LIVE below to trade real money.
+                  </p>
+                )}
+              </div>
             )}
 
             {isLive && (

@@ -10,6 +10,27 @@ backtest mode that trains the AI Brain on historical candles in seconds.
 
 ---
 
+## Screenshots
+
+| Dashboard (paper mode, real Coinbase prices) | Mobile |
+|---|---|
+| ![Dashboard: six-agent pipeline, filter rules and analyst score](docs/screenshots/dashboard.png) | <img src="docs/screenshots/mobile.png" alt="Mobile layout" width="260"> |
+
+**Coinbase panel, live mode**: fee tier from the account, the "why no trades?" entry funnel, stops resting on Coinbase,
+drawdown vs. limit. *(Captured against a local mock exchange: the balance and key shown are test values.)*
+
+![Coinbase panel with entry funnel and live status](docs/screenshots/coinbase-panel.png)
+
+**Autonomous research desk**: daily walk-forward on real candles, forward tests, promotion/demotion journal.
+
+![Autonomous desk](docs/screenshots/desk.png)
+
+**Backtest**: replays real 1-minute Coinbase candles through the same pipeline, net of fees.
+
+![Backtest dialog](docs/screenshots/backtest.png)
+
+---
+
 ## Quickstart
 
 ```bash
@@ -143,6 +164,35 @@ a non-losing second half and max drawdown <= 10%. A pass expires after 3 days. I
 
 Other related settings: `PAPER_FEE_PCT` (paper-mode fee per side, default 0.6 for majors) and, in live mode, the bot no
 longer takes random "exploration" strategy samples.
+
+## Why isn't it trading? (measured, not guessed)
+
+The Coinbase panel's **"why no trades?"** box shows, for the last hour, how many candidates were checked, passed the
+filter, scored at or above the gate, had no strategy trigger, were skipped by the fee guard or by a lock, and entered,
+plus the single reason it is holding back. Common reasons, in the order to check them:
+
+1. **It is in paper mode.** Every restart or redeploy (including every merge to `main`) comes back in paper. Type
+   `ENABLE LIVE` again in the Coinbase panel.
+2. **Live entries are locked after a restart** that happened with a position open: re-confirm with `ENABLE LIVE`.
+3. **A breaker is on**: daily/weekly loss cap, drawdown breaker or a booked profit target; press RESUME after review.
+4. **No setup reaches the score gate (70).** Replaying 5 days of real 1-minute Coinbase candles (8 majors, scored every
+   5 minutes, Nov 2026): median score 48, 99th percentile 66, and only 29 of 11,800 samples (0.25%) reached 70.
+5. **The fee guard.** None of those 29 had a stop wider than the 1.28% round-trip cost at 0.6% taker fees, so at the
+   standard fee tier the majors engine places essentially no trades.
+
+Loosening the gates does not fix this; it loses money faster. A 7-day replay on real candles, net of fees:
+
+| fee/side | score gate | stop floor | trades | win rate | before fees | after fees |
+|---|---|---|---|---|---|---|
+| 0.6% | 70 | 1% | 12 | 17% | -0.09% | -0.80% |
+| 0.6% | 62 | 1% | 45 | 11% | -0.24% | -2.49% |
+| 0.6% | 62 | 2% | 48 | 8% | -0.71% | -3.25% |
+| 0.6% | 55 | 2% | 76 | 13% | -0.91% | -4.42% |
+| 0.4% | 62 | 2% | 52 | 12% | -0.56% | -2.33% |
+
+Every variant loses even before fees. The quiet bot is the gates working: the 1-minute signal has no edge on the
+majors right now, and the research desk has not found a strategy that earns promotion. Making it trade more would need
+a strategy that passes the desk's walk-forward and forward test first.
 
 ## The autonomous desk (self-improving research loop)
 
