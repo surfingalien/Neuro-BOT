@@ -84,17 +84,16 @@ export function pickStrategy(
     v: Math.max(0.02, weights[s]) * fit[s],
   }));
   const total = adjusted.reduce((a, b) => a + b.v, 0);
-  // softmax sample with temperature
-  const tau = 0.22;
-  let roll = Math.random();
-  let chosen = adjusted[0].s;
+  // weighted sample: P(strategy) = weight × regime-fit / total. The old "softmax" never normalised its
+  // probabilities, so it fell through to momentum ~98% of the time and the learned weights barely mattered.
+  let roll = Math.random() * total;
+  let chosen = adjusted[adjusted.length - 1].s;
   for (const a of adjusted) {
-    const p = Math.exp(Math.log(a.v / total) / tau);
-    if (roll <= p) {
+    if (roll < a.v) {
       chosen = a.s;
       break;
     }
-    roll -= p;
+    roll -= a.v;
   }
   const regimeName =
     regime === "ranging" ? "ranging regime" : regime === "trending_up" ? "up-trend regime" : "down-trend regime";

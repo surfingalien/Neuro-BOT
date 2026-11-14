@@ -42,7 +42,8 @@ export const FAMILY_LABEL: Record<Family, string> = {
   pullback: "1h uptrend pullback",
 };
 
-const FEE = 0.006; // Coinbase taker, low volume tier
+import { takerFee } from "./fees";
+const FEE = () => takerFee(); // the account's real taker fee (0.6% until Coinbase reports the tier)
 const DAYS = 460;
 const WARMUP = 400;
 const TRAIN = 24 * 120;
@@ -161,11 +162,11 @@ export async function loadDesk(): Promise<DeskState> {
   return box.state;
 }
 
-export const deskSnapshot = () => ({ ...box.state, fee: FEE, forwardMinDays: FORWARD_MIN_DAYS, researchEveryHours: RESEARCH_EVERY_MS / 3_600_000 });
+export const deskSnapshot = () => ({ ...box.state, fee: FEE(), forwardMinDays: FORWARD_MIN_DAYS, researchEveryHours: RESEARCH_EVERY_MS / 3_600_000 });
 
 // ───────────────────────── family plumbing ─────────────────────────
 
-const cfg = (): SimCfg => ({ ...DEFAULT_SIM, feeRate: FEE });
+const cfg = (): SimCfg => ({ ...DEFAULT_SIM, feeRate: FEE() });
 
 function simFamily(f: Family, p: Params, data: Record<string, Ind>, from: number, to: number): SimResult {
   if (f === "rotation") return simulateRotation(data, p as { lookback: number; topK: number; every: number; trend: number }, cfg(), from, to);

@@ -75,6 +75,9 @@ environment variables on your host (never typed into the UI, never stored in the
 | `APP_PASSWORD` | dashboard login (HTTP Basic, any username). **Required for live trading** |
 | `LIVE_BANKROLL_USD` | most the bot will ever manage (default `100`) |
 | `LIVE_MAX_ORDER_USD` | hard cap per buy order (default `25`) |
+| `LIVE_EXCHANGE_STOPS` | `false` turns off the stop + take-profit resting on Coinbase (default on) |
+| `MAX_DRAWDOWN_PCT` | drawdown breaker: flatten and halt when equity falls this far below its peak (default `10`) |
+| `FEE_GUARD` | `false` turns off the refusal of fee-dominated trades (default on) |
 
 Create the key at the Coinbase Developer Platform with **View + Trade** permissions
 only (never Transfer/withdraw).
@@ -90,8 +93,27 @@ How live mode is fenced in:
 - If a sell fails the position stays open, is retried every 30s, and a Telegram alert fires (if enabled).
 - `SELL ALL & GO PAPER` sells every live position and returns to the paper book. Reset is refused in live mode.
 
-Know the limits: stops and targets are checked by this app every ~3s (they are not
-resting orders on Coinbase), so if the app is down nothing is watching your positions.
+### Protection and bookkeeping on real orders
+
+- **Stops rest on Coinbase.** After every live buy the bot places a `trigger_bracket_gtc` sell on Coinbase: a stop at the
+  position's stop and a take-profit limit at TP2. The position stays protected if the app crashes or redeploys. The coins
+  are "on hold" while it rests, so before any app-side sell (TP1, trailing, timeout, breakers, SELL ALL) the bot cancels the
+  bracket first; if the cancel reveals the bracket already executed, it books that fill instead of selling twice. After TP1,
+  and when the trailing stop moves up meaningfully (at most every 5 min), the bracket is re-placed on the remaining coins.
+  Every 20 s the bot checks the bracket: an execution is booked from the real fill, a bracket cancelled outside the bot is
+  re-placed. If placing it fails, the app-side stop still works and the panel shows "stops on Coinbase: x/y".
+- **Every order is recorded before it is sent** (`Order` table, with our client order id). If a reply is lost the order
+  is found by its client id; at boot every in-flight order is resolved against Coinbase.
+- **Balance check.** Every 10 minutes the bot compares the coins it thinks it holds with what Coinbase holds and raises a
+  `BALANCE MISMATCH` alert if coins were sold outside the bot. The panel marks which part of each holding is the bot's.
+- **Real fee tier.** The account's maker/taker rates are read from Coinbase (hourly) and used for paper fills, the
+  validation backtest, the research desk and the fee guard. Until they are read, 0.6% taker is assumed.
+- **Fee guard.** An entry whose stop is closer than the round-trip cost (2 × taker + slippage) is skipped: a stop-out would
+  cost more than twice the planned risk. At the default 0.6% taker this skips most quiet-market majors setups; that is
+  deliberate, because those trades lost money after fees in every test.
+- **Drawdown breaker.** If equity (balance + open P&L) falls `MAX_DRAWDOWN_PCT` below its peak, everything is sold and new
+  entries stop until you press RESUME. The state survives restarts.
+
 Orders are market orders and pay Coinbase taker fees (all P&L is net of real fees).
 The strategy is experimental; it can and will lose money. Start with a bankroll you can lose.
 
