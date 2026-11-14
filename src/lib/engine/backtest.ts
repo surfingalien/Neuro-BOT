@@ -16,6 +16,8 @@ import { computeTargets, runAnalyst, runFilter } from "./rules";
 import { checkEntrySignal, pickStrategy } from "./strategies";
 import { MAJOR_SYMBOLS } from "./market";
 import { cbCandles, toProductId } from "./coinbase";
+import { takerFee } from "./fees";
+import { isoWeekKey } from "./util";
 import { fetchMemecoins } from "./market";
 import type { Candle, Klines, MarketFocus, ScoutPair, StrategyId } from "./types";
 import { clamp } from "./indicators";
@@ -402,7 +404,7 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
     if (minLen < WARMUP + 60) throw new Error("not enough history fetched");
 
     // fees: paper/backtest used to charge only 0.04% slippage; Coinbase market orders cost ~0.6%/side at low volume tiers
-    const feeRate = typeof params.feeRate === "number" && params.feeRate >= 0 ? Math.min(0.02, params.feeRate) : scope === "memecoins" ? 0.003 : 0.006;
+    const feeRate = typeof params.feeRate === "number" && params.feeRate >= 0 ? Math.min(0.02, params.feeRate) : scope === "memecoins" ? 0.003 : takerFee();
     let feesPaid = 0;
     const byReason: Record<string, { n: number; pnl: number }> = {};
     let balance = startBalance;
@@ -432,8 +434,7 @@ export async function runBacktest(params: BacktestParams, liveBrain: BrainCore |
     for (let i = WARMUP; i < minLen; i++) {
       const bar = refCandles[i];
       const dKey = new Date(bar.t).toISOString().slice(0, 10);
-      const wkNum = Math.ceil(((bar.t - Date.UTC(new Date(bar.t).getUTCFullYear(), 0, 1)) / 86_400_000 + new Date(bar.t).getUTCDay() + 1) / 7);
-      const wKey = `${new Date(bar.t).getUTCFullYear()}-W${String(wkNum).padStart(2, "0")}`;
+      const wKey = isoWeekKey(bar.t);
 
       // ── day / week rollover ──
       if (dKey !== dayKey) {

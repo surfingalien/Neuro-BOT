@@ -22,9 +22,7 @@ export async function POST(req: Request) {
 
   switch (body.action) {
     case "start":
-      engine.halted = false;
-      engine.weekHalted = false; // manual resume also clears the weekly breaker
-      engine.setRunning(true);
+      engine.resumeAfterHalt(); // clears daily/weekly/drawdown breakers and restarts the drawdown peak
       break;
     case "pause":
       engine.setRunning(false);

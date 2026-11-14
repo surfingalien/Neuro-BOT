@@ -24,12 +24,19 @@ interface CbInfo {
     entriesLocked: boolean;
     bankroll: number | null;
     openLive: number;
+    protectedLive?: number;
+    exchangeStops?: boolean;
+    drawdownPct?: number;
+    ddHalted?: boolean;
+    maxDrawdownPct?: number;
     feed: string;
     gate: number;
     running: boolean;
     diag: { lastSkip: string; lastSkipAt: number; lastError: string; lastErrorAt: number; buys: number; sells: number; lastOrderAt: number };
   };
   holdings: Holding[];
+  fees?: { maker: number; taker: number; tier: string; volume30d: number; source: string };
+  managed?: Record<string, number>;
   usd: number;
   totalUsd: number;
   error?: string;
@@ -198,14 +205,24 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                       {info.holdings.map((h) => (
                         <tr key={h.currency} className="text-slate-300 border-t border-slate-800/60">
                           <td className="py-1">{h.currency}</td>
-                          <td className="text-right">{qtyFmt(h.qty)}{h.hold > 0 ? " *" : ""}</td>
+                          <td className="text-right">
+                            {qtyFmt(h.qty)}{h.hold > 0 ? " *" : ""}
+                            {info.managed?.[h.currency] ? <span className="block text-[9px] text-sky-400">bot: {qtyFmt(info.managed[h.currency])}</span> : null}
+                          </td>
                           <td className="text-right">{h.price ? usd(h.price) : "—"}</td>
                           <td className="text-right">{usd(h.usdValue)}</td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
-                  {info.holdings.some((h) => h.hold > 0) && <p className="text-[9px] text-slate-600">* includes funds on hold</p>}
+                  {info.holdings.some((h) => h.hold > 0) && <p className="text-[9px] text-slate-600">* includes funds on hold (a resting stop holds the coins it protects)</p>}
+                  {info.fees && (
+                    <p className="text-[9px] text-slate-500">
+                      fees: {(info.fees.taker * 100).toFixed(2)}% taker · {(info.fees.maker * 100).toFixed(2)}% maker
+                      {info.fees.source === "coinbase" ? ` · ${info.fees.tier || "tier"} (from your account)` : " · default (account tier not read yet)"} · round trip ≈{" "}
+                      {((info.fees.taker * 2 + 0.0008) * 100).toFixed(2)}%
+                    </p>
+                  )}
                 </div>
               </>
             )}
@@ -220,6 +237,20 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                   <span>score gate: <b>{info.live.gate}</b></span>
                   <span>orders: <b>{info.live.diag.buys}</b> buys · <b>{info.live.diag.sells}</b> sells{info.live.diag.lastOrderAt ? ` · last ${ago(info.live.diag.lastOrderAt)}` : ""}</span>
                   <span>open: <b>{info.live.openLive}</b></span>
+                  {info.live.exchangeStops !== undefined && (
+                    <span>
+                      stops on Coinbase:{" "}
+                      <b className={!info.live.exchangeStops ? "text-amber-300" : (info.live.protectedLive ?? 0) < info.live.openLive ? "text-rose-400" : "text-emerald-400"}>
+                        {!info.live.exchangeStops ? "off" : `${info.live.protectedLive ?? 0}/${info.live.openLive}`}
+                      </b>
+                    </span>
+                  )}
+                  {info.live.drawdownPct !== undefined && (
+                    <span>
+                      drawdown: <b className={info.live.ddHalted ? "text-rose-400" : "text-slate-200"}>{info.live.drawdownPct.toFixed(1)}%</b> / {info.live.maxDrawdownPct}%
+                      {info.live.ddHalted ? " · HALTED" : ""}
+                    </span>
+                  )}
                 </div>
                 {info.live.diag.lastError && (
                   <p className="text-[10px] text-rose-400 leading-snug">last order error ({ago(info.live.diag.lastErrorAt)}): {info.live.diag.lastError}</p>
@@ -314,8 +345,10 @@ export default function CoinbasePanel({ snap, onChanged }: { snap: BotSnapshot; 
                 <div className="flex flex-col gap-2">
                   <p className="text-[10px] text-rose-300 leading-snug">
                     Real market orders are being placed on Coinbase · majors only · max order {usd(info.limits.maxOrderUsd)} ·
-                    bankroll cap {usd(info.limits.bankrollCap)}. Stops are checked by this app every ~3s (not resting
-                    exchange orders).
+                    bankroll cap {usd(info.limits.bankrollCap)}.{" "}
+                    {info.live.exchangeStops === false
+                      ? "Stops are checked by this app every ~3s (not resting exchange orders)."
+                      : "Each position gets a stop + take-profit resting on Coinbase, so it stays protected even if this app goes down."}
                   </p>
                   <div className="flex gap-2 flex-wrap">
                     {locked && (

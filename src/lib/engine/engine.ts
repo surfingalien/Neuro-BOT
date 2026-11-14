@@ -11,7 +11,10 @@ import {
   stratParams,
   type BrainCore,
 } from "./brain";
-import { cbAccounts, cbMarketOrder, cbConfigured, cbProducts, liveGate, liveLimits, toProductId } from "./coinbase";
+import { cbAccounts, cbConfigured, cbProducts, liveGate, liveLimits, toProductId } from "./coinbase";
+import { feeModel, paperFee, refreshFees, takerFee } from "./fees";
+import { cancelProtection, liveMarket, orderState, placeProtection, reconcileOrders } from "./orders";
+import { isoWeekKey, utcDayKey } from "./util";
 import { runBacktest } from "./backtest";
 import { startDesk } from "./desk";
 import { dataSourceBadge, fetchKlines, fetchMajors, fetchMemecoins } from "./market";
@@ -33,12 +36,11 @@ import { TG_DEFAULT_EVENTS, tgConfigure, tgConfig, tgEnabledFor, tgNotify, type 
 import type { BrainView } from "./backtest";
 
 const TICK_MS = 3000;
-/** exchange fee per side charged in PAPER mode (live pays the real fee). Majors ≈ Coinbase taker at low volume tiers.
- *  Override with PAPER_FEE_PCT (e.g. 0.25). Paper used to charge none, which made results look far better than live. */
-const paperFee = (market: "majors" | "memecoin"): number => {
-  const v = parseFloat(process.env.PAPER_FEE_PCT ?? "");
-  return isFinite(v) && v >= 0 ? Math.min(2, v) / 100 : market === "majors" ? 0.006 : 0.003;
-};
+const MAX_DRAWDOWN_PCT = (() => {
+  const v = parseFloat(process.env.MAX_DRAWDOWN_PCT ?? "");
+  return isFinite(v) && v > 0 ? v : 10;
+})();
+const exchangeStopsOn = () => process.env.LIVE_EXCHANGE_STOPS !== "false";
 const ENGINE_VERSION = 10; // bump to force engine rebuild on code change (dev HMR)
 
 interface Settings {
@@ -136,6 +138,11 @@ class Engine {
   paperStartBalance = 1000;
   liveEntriesLocked = false; // booted into live with open positions: manage exits, no new entries until re-confirmed
   sellBackoff = new Map<string, number>(); // position id → earliest next sell attempt
+  equityPeak = 0; // drawdown breaker: highest equity of the current book
+  ddHalted = false;
+  drawdownPct = 0;
+  balanceCheckAt = 0;
+  mismatchLoggedAt = new Map<string, number>();
   validation: ValidationRecord | null = null; // last real-data, after-fees check of the active strategy
   liveDiag = { lastSkip: "", lastSkipAt: 0, lastError: "", lastErrorAt: 0, buys: 0, sells: 0, lastOrderAt: 0 };
 
@@ -220,6 +227,8 @@ class Engine {
       this.dayKey = s.dayKey;
       this.dayPnl = s.dayPnl;
       this.paperBalance = s.paperBalance;
+      this.equityPeak = s.equityPeak;
+      this.ddHalted = s.ddHalted;
       try {
         if (s.validationJson) this.validation = JSON.parse(s.validationJson) as ValidationRecord;
       } catch { /* none */ }
@@ -291,7 +300,7 @@ class Engine {
           entryScores: restoreEntryScores(t.featuresJson),
           source: "restored",
           ...(t.mode === "live"
-            ? { live: true, heldQty: t.heldQty > 0 ? t.heldQty : t.qty, bankedPnl: t.realizedPnl }
+            ? { live: true, heldQty: t.heldQty > 0 ? t.heldQty : t.qty, bankedPnl: t.realizedPnl, ...(t.exOrderId ? { exOrderId: t.exOrderId, exStop: t.stopLoss } : {}) }
             : {}),
         });
       }
@@ -309,6 +318,12 @@ class Engine {
 
       this.startedAt = Date.now();
       void startDesk().catch(() => undefined); // autonomous research desk (paper-only background loop)
+      if (cbConfigured()) {
+        await refreshFees(true).catch(() => undefined); // the account's real fee tier
+        // resolve any real order that was in flight when the app last stopped, BEFORE anything trades
+        await reconcileOrders((lvl, msg) => this.log(lvl, msg)).catch(() => undefined);
+        if (this.positions.some((p) => p.live)) await this.reconcileBalances(true).catch(() => undefined);
+      }
       this.log("BOOT", `engine booted · mode ${this.settings.mode} · balance $${this.settings.balance.toFixed(2)}`);
       if (this.positions.length) this.log("INFO", `restored ${this.positions.length} open position(s) from db`);
 
@@ -334,6 +349,8 @@ class Engine {
           startBalance: this.settings.startBalance,
           balance: this.settings.balance,
           paperBalance: this.paperBalance,
+          equityPeak: this.equityPeak,
+          ddHalted: this.ddHalted,
           validationJson: this.validation ? JSON.stringify(this.validation) : "",
           maxPositionPct: this.settings.maxPositionPct,
           stopLossPct: this.settings.stopLossPct,
@@ -390,12 +407,10 @@ class Engine {
 
   /** UTC day key "2026-11-08" · ISO week key "2026-W45" */
   timeKeys(): { day: string; week: string } {
-    const now = new Date();
-    const day = now.toISOString().slice(0, 10);
-    const jan1 = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
-    const week = Math.ceil(((now.getTime() - jan1.getTime()) / 86_400_000 + jan1.getUTCDay() + 1) / 7);
-    return { day, week: `${now.getUTCFullYear()}-W${String(week).padStart(2, "0")}` };
+    const now = Date.now();
+    return { day: utcDayKey(now), week: isoWeekKey(now) }; // real ISO weeks (Monday start)
   }
+
 
   /** new UTC day / week → reset bookkeeping · daily/weekly targets auto-rearm · loss-cap halts need manual resume */
   rolloverIfNeeded() {
@@ -559,10 +574,16 @@ balance ${fmtUsd(this.settings.balance)}`);
 
       await this.managePositions();
       await this.checkTargets(); // target manager — book profit / loss by targets (daily + weekly)
+      await this.checkDrawdown();
+      if (this.tickN % 200 === 0) void refreshFees().catch(() => undefined); // hourly-cached
+      if (this.positions.some((p) => p.live) && Date.now() - this.balanceCheckAt > 10 * 60_000) await this.reconcileBalances(false).catch(() => undefined);
 
-      const entriesBlocked = this.halted || this.targetHit || this.weekTargetHit || this.weekHalted;
+      const entriesBlocked = this.halted || this.targetHit || this.weekTargetHit || this.weekHalted || this.ddHalted;
       if (!entriesBlocked && this.positions.length < this.settings.maxPositions) {
         await this.pipeline();
+      } else if (this.ddHalted) {
+        this.phase = "HALTED";
+        this.phaseDetail = `drawdown breaker: equity fell ${this.drawdownPct.toFixed(1)}% from its peak — flattened, resume manually after review`;
       } else if (this.halted) {
         this.phase = "HALTED";
         this.phaseDetail = "daily loss cap — resume manually after review";
@@ -705,7 +726,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     entryScores: number[] = []
   ) {
     // target manager wins: never enter while booked out / circuit-broken (daily or weekly)
-    if (this.halted || this.targetHit || this.weekTargetHit || this.weekHalted) return;
+    if (this.halted || this.targetHit || this.weekTargetHit || this.weekHalted || this.ddHalted) return;
     const live = this.settings.mode === "live";
     if (live) {
       // real money: only Coinbase-listed majors priced from the real Coinbase feed, never simulated data
@@ -726,13 +747,29 @@ balance ${fmtUsd(this.settings.balance)}`);
     let entry = pair.price * (1 + slip);
     let qty = sizeUsd / entry;
     let liveOrderId = "";
+
+    // fee-dominated trades are refused: if the stop is closer than the round-trip cost, a stop-out costs
+    // more than twice the planned risk and even winners barely clear fees. (Measured: these lose money.)
+    {
+      const sp0 = stratParams(this.brain, strategy);
+      const t0 = computeTargets(entry, pair.market, k, { stopMult: sp0.stopMult, tpMult: sp0.tpMult });
+      const feeSide = live ? takerFee() : paperFee(pair.market);
+      const roundTrip = 2 * feeSide + 2 * slip;
+      const stopDist = (entry - t0.stopLoss) / entry;
+      if (stopDist < roundTrip && process.env.FEE_GUARD !== "false") {
+        const why = `${pair.base}: stop ${(stopDist * 100).toFixed(2)}% is inside the ${(roundTrip * 100).toFixed(2)}% round-trip cost — fee-dominated, skipped`;
+        if (live) return this.liveSkip(why);
+        if (this.tickN % 20 === 0) this.log("INFO", why);
+        return;
+      }
+    }
     if (live) {
       // place the REAL market buy first; everything below is built from what actually filled
       try {
         const [prod] = await cbProducts([toProductId(pair.symbol)], 1500);
         if (!prod?.tradable) throw new Error("product not tradable on Coinbase");
         if (sizeUsd < prod.quoteMin) throw new Error(`size below Coinbase minimum $${prod.quoteMin}`);
-        const fill = await cbMarketOrder(prod.id, "BUY", { quoteUsd: sizeUsd, quoteInc: prod.quoteIncrement });
+        const fill = await liveMarket({ symbol: pair.symbol, side: "BUY", purpose: "entry", quoteUsd: sizeUsd });
         sizeUsd = fill.grossUsd + fill.feesUsd;
         qty = fill.filledSize;
         entry = sizeUsd / qty; // fee-inclusive cost basis per coin
@@ -824,6 +861,163 @@ balance ${fmtUsd(this.settings.balance)}`);
       if (decisionReason) this.log("EXEC", `${pair.base} strategy pick · ${decisionReason}`);
       this.phaseDetail = `EXECUTOR filled ${pair.base} ${fmtUsd(sizeUsd)} · stop + targets armed`;
     } catch { /* log/phase failure is cosmetic */ }
+    if (live) {
+      const pos = this.positions[this.positions.length - 1];
+      if (pos?.live) await this.armProtection(pos, pos.stopLoss);
+    }
+  }
+
+  // ───────────── exchange-side protection (resting bracket on Coinbase) ─────────────
+
+  /** place a resting stop + take-profit on Coinbase so the position is protected even if this app is down */
+  async armProtection(pos: Position, stop: number): Promise<void> {
+    if (!pos.live || !exchangeStopsOn()) return;
+    const qty = pos.heldQty ?? pos.qty;
+    if (!(qty > 0) || !(stop > 0) || stop >= pos.price) return;
+    try {
+      const id = await placeProtection({ symbol: pos.symbol, baseQty: qty, takeProfit: pos.tp2, stop, tradeId: pos.id });
+      pos.exOrderId = id;
+      pos.exStop = stop;
+      pos.exRearmAt = Date.now();
+      await db.trade.update({ where: { id: pos.id }, data: { exOrderId: id } }).catch(() => undefined);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "error";
+      this.liveDiag.lastError = `PROTECT ${pos.base}: ${msg}`;
+      this.liveDiag.lastErrorAt = Date.now();
+      this.log("RISK", `${pos.base}: could not rest a stop on Coinbase (${msg}) · app-side stops still active`);
+    }
+  }
+
+  /** cancel the resting bracket before an app-side sell (its coins are on hold while it rests).
+   *  Returns the fill if the bracket had ALREADY executed on Coinbase, "clear" when cancelled, or null if unknown. */
+  async disarmProtection(pos: Position): Promise<{ netUsd: number; soldQty: number; fullyFilled: boolean } | "clear" | null> {
+    if (!pos.exOrderId) return "clear";
+    const id = pos.exOrderId;
+    const { state, filled } = await cancelProtection(id);
+    if (!state) return null; // can't confirm — don't sell coins that may still be on hold
+    pos.exOrderId = undefined;
+    pos.exStop = undefined;
+    await db.trade.update({ where: { id: pos.id }, data: { exOrderId: "" } }).catch(() => undefined);
+    if (!filled) return "clear";
+    const held = pos.heldQty ?? pos.qty;
+    return {
+      netUsd: state.fill.grossUsd - state.fill.feesUsd,
+      soldQty: state.fill.filledSize,
+      fullyFilled: state.fill.filledSize >= held * 0.999,
+    };
+  }
+
+  /** the resting bracket may have fired while we were busy or down: book it from the real fill */
+  async checkProtection(pos: Position): Promise<boolean> {
+    if (!pos.live || !pos.exOrderId || Date.now() - (pos.exCheckedAt ?? 0) < 20_000) return false;
+    pos.exCheckedAt = Date.now();
+    const st = await orderState(pos.exOrderId).catch(() => null);
+    if (!st) return false;
+    const held = pos.heldQty ?? pos.qty;
+    if (st.status === "FILLED" && st.fill.filledSize > 0) {
+      pos.exOrderId = undefined;
+      const netUsd = st.fill.grossUsd - st.fill.feesUsd;
+      const reason = st.fill.avgPrice >= pos.tp2 * 0.995 ? "tp2" : pos.trailActive ? "trail" : "stop";
+      this.log("RISK", `${pos.base}: the stop/take-profit resting on Coinbase executed (${st.fill.filledSize} @ ${st.fill.avgPrice.toFixed(4)}) · booking it`);
+      if (st.fill.filledSize < held * 0.999) {
+        // partial: bank it, sell what is left from the app
+        this.bankPartial(pos, netUsd, st.fill.filledSize);
+        return this.closePosition(pos, pos.price, reason);
+      }
+      return this.closePosition(pos, pos.price, reason, { netUsd, soldQty: st.fill.filledSize });
+    }
+    if (st.status === "CANCELLED" || st.status === "EXPIRED" || st.status === "FAILED") {
+      if (st.fill.filledSize > 0) this.bankPartial(pos, st.fill.grossUsd - st.fill.feesUsd, st.fill.filledSize);
+      pos.exOrderId = undefined;
+      await db.trade.update({ where: { id: pos.id }, data: { exOrderId: "" } }).catch(() => undefined);
+      this.log("RISK", `${pos.base}: the protective order on Coinbase is gone (${st.status.toLowerCase()}) · re-placing it`);
+      await this.armProtection(pos, Math.max(pos.stopLoss, pos.exStop ?? 0));
+    }
+    return false;
+  }
+
+  bankPartial(pos: Position, netUsd: number, soldQty: number) {
+    const booked = netUsd - pos.entryPrice * soldQty;
+    pos.heldQty = Math.max(0, (pos.heldQty ?? pos.qty) - soldQty);
+    pos.bankedPnl = (pos.bankedPnl ?? 0) + booked;
+    this.settings.balance += booked;
+    void db.trade
+      .update({ where: { id: pos.id }, data: { realizedPnl: { increment: booked }, heldQty: pos.heldQty } })
+      .catch(() => undefined);
+  }
+
+  /** compare what the bot thinks it holds with what Coinbase actually holds */
+  async reconcileBalances(force: boolean): Promise<void> {
+    this.balanceCheckAt = Date.now();
+    const live = this.positions.filter((p) => p.live);
+    if (live.length === 0 || !cbConfigured()) return;
+    const accounts = await cbAccounts();
+    const onExchange = new Map(accounts.map((a) => [a.currency, a.available + a.hold]));
+    const tracked = new Map<string, number>();
+    for (const p of live) {
+      const cur = p.symbol.replace(/USDT$/, "");
+      tracked.set(cur, (tracked.get(cur) ?? 0) + (p.heldQty ?? p.qty));
+    }
+    for (const [cur, botQty] of tracked) {
+      const ex = onExchange.get(cur) ?? 0;
+      if (ex < botQty * 0.98) {
+        const last = this.mismatchLoggedAt.get(cur) ?? 0;
+        if (force || Date.now() - last > 30 * 60_000) {
+          this.mismatchLoggedAt.set(cur, Date.now());
+          const msg = `BALANCE MISMATCH ${cur}: the bot tracks ${botQty.toPrecision(6)} but Coinbase holds ${ex.toPrecision(6)} — coins were sold outside the bot`;
+          this.liveDiag.lastError = msg;
+          this.liveDiag.lastErrorAt = Date.now();
+          this.log("RISK", msg);
+          if (tgEnabledFor("breaker")) tgNotify("breaker", "⚠️ Balance mismatch", msg);
+        }
+      }
+    }
+  }
+
+  /** coins the bot is managing, by currency (everything else in the account is the owner's) */
+  managedHoldings(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const p of this.positions.filter((x) => x.live)) {
+      const cur = p.symbol.replace(/USDT$/, "");
+      out[cur] = (out[cur] ?? 0) + (p.heldQty ?? p.qty);
+    }
+    return out;
+  }
+
+  // ───────────── drawdown breaker ─────────────
+
+  currentEquity(): number {
+    let eq = this.settings.balance;
+    for (const p of this.positions) {
+      const openQty = p.live ? p.heldQty ?? p.qty : p.qty * (p.tp1Booked ? 0.5 : 1);
+      eq += (p.price - p.entryPrice) * openQty;
+    }
+    return eq;
+  }
+
+  async checkDrawdown(): Promise<void> {
+    const eq = this.currentEquity();
+    if (!(this.equityPeak > 0)) this.equityPeak = eq;
+    this.equityPeak = Math.max(this.equityPeak, eq);
+    this.drawdownPct = this.equityPeak > 0 ? ((this.equityPeak - eq) / this.equityPeak) * 100 : 0;
+    if (!this.ddHalted && this.drawdownPct >= MAX_DRAWDOWN_PCT) {
+      this.ddHalted = true;
+      this.log("RISK", `DRAWDOWN BREAKER: equity is ${this.drawdownPct.toFixed(1)}% below its peak (limit ${MAX_DRAWDOWN_PCT}%) · flattening, entries halted until you resume`);
+      if (this.positions.length > 0) await this.closeAll("circuit");
+      if (tgEnabledFor("breaker")) tgNotify("breaker", "🛑 Drawdown breaker", `equity ${this.drawdownPct.toFixed(1)}% below peak · all positions closed · resume manually`);
+      await this.persistSettings();
+    }
+  }
+
+  /** operator RESUME: clears the daily/weekly/drawdown breakers; the drawdown peak restarts from here */
+  resumeAfterHalt() {
+    this.halted = false;
+    this.weekHalted = false;
+    if (this.ddHalted) this.log("RISK", "drawdown breaker cleared by operator · peak reset to current equity");
+    this.ddHalted = false;
+    this.equityPeak = this.currentEquity();
+    this.drawdownPct = 0;
+    this.setRunning(true);
   }
 
   // ───────────── RISK agent ─────────────
@@ -849,6 +1043,7 @@ balance ${fmtUsd(this.settings.balance)}`);
       if (pos.series.length > 240) pos.series.shift();
       if (px > pos.trailPeak) pos.trailPeak = px;
 
+      if (pos.live && pos.exOrderId && (await this.checkProtection(pos))) continue; // executed on Coinbase
       const close = await this.riskCheck(pos, px);
       if (!close) stillOpen.push(pos);
     }
@@ -871,10 +1066,30 @@ balance ${fmtUsd(this.settings.balance)}`);
       return await this.closePosition(pos, px, reason); // false (live sell failed) → stays open, retried
     }
 
+    // keep the stop resting on Coinbase in step with the trailing stop (at most every 5 min, only meaningful moves)
+    if (pos.live && pos.exOrderId && pos.trailActive && exchangeStopsOn()) {
+      const want = Math.max(pos.stopLoss, trailStop);
+      if (want > (pos.exStop ?? 0) * 1.005 && Date.now() - (pos.exRearmAt ?? 0) > 5 * 60_000) {
+        const d = await this.disarmProtection(pos);
+        if (d && d !== "clear") {
+          if (d.fullyFilled) return this.closePosition(pos, px, "trail", { netUsd: d.netUsd, soldQty: d.soldQty });
+          this.bankPartial(pos, d.netUsd, d.soldQty);
+        }
+        if (d) await this.armProtection(pos, want);
+      }
+    }
+
     if (!pos.tp1Booked && px >= pos.tp1) {
       // book half at TP1, arm trailing on the runner
       let booked = ((pos.tp1 - pos.entryPrice) * pos.qty) / 2 - pos.tp1 * (pos.qty / 2) * paperFee(pos.market);
       if (pos.live) {
+        // the resting bracket holds the coins: cancel it first (it may even have executed already)
+        const d = await this.disarmProtection(pos);
+        if (d === null) return false; // can't confirm the resting order's state — try again next tick
+        if (d !== "clear") {
+          if (d.fullyFilled) return this.closePosition(pos, px, "tp2", { netUsd: d.netUsd, soldQty: d.soldQty });
+          this.bankPartial(pos, d.netUsd, d.soldQty);
+        }
         // real partial sell; if it can't be placed, trail the whole position instead of retrying every tick
         const held = pos.heldQty ?? pos.qty;
         const r = await this.liveSell(pos, held / 2);
@@ -892,6 +1107,7 @@ balance ${fmtUsd(this.settings.balance)}`);
       pos.trailActive = true;
       pos.trailPeak = px;
       this.log("TRAIL", `${pos.base} +12% zone hit · booked ½ ${fmtUsd(booked)} · trailing ${this.settings.trailGapPct}% under peak`);
+      if (pos.live) await this.armProtection(pos, Math.max(pos.stopLoss, px * (1 - this.settings.trailGapPct / 100)));
       try {
         await db.trade.update({
           where: { id: pos.id },
@@ -913,9 +1129,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     if (Date.now() < (this.sellBackoff.get(pos.id) ?? 0)) return null;
     try {
       if (!cbConfigured()) throw new Error("coinbase credentials missing — cannot sell");
-      const [prod] = await cbProducts([toProductId(pos.symbol)], 1500);
-      if (!prod) throw new Error("product not found");
-      const fill = await cbMarketOrder(prod.id, "SELL", { baseQty: qty, baseInc: prod.baseIncrement });
+      const fill = await liveMarket({ symbol: pos.symbol, side: "SELL", purpose: "exit", baseQty: qty, tradeId: pos.id });
       this.sellBackoff.delete(pos.id);
       const netUsd = fill.grossUsd - fill.feesUsd;
       this.liveDiag.sells += 1;
@@ -933,10 +1147,23 @@ balance ${fmtUsd(this.settings.balance)}`);
   }
 
   /** returns false when a live sell failed — the position is then left open and retried */
-  async closePosition(pos: Position, px: number, reason: string): Promise<boolean> {
+  async closePosition(pos: Position, px: number, reason: string, preFill?: { netUsd: number; soldQty: number }): Promise<boolean> {
     let realizedLive: number | undefined;
     if (pos.live) {
-      const r = await this.liveSell(pos, pos.heldQty ?? pos.qty);
+      let r = preFill ? { ...preFill, netPrice: preFill.netUsd / preFill.soldQty } : null;
+      if (!r) {
+        // cancel the resting bracket first: its coins are on hold, and it may already have executed
+        const d = await this.disarmProtection(pos);
+        if (d === null) {
+          this.log("RISK", `${pos.base}: can't confirm the resting Coinbase order's state · will retry the exit`);
+          return false;
+        }
+        if (d !== "clear") {
+          if (d.fullyFilled) r = { netUsd: d.netUsd, soldQty: d.soldQty, netPrice: d.netUsd / d.soldQty };
+          else this.bankPartial(pos, d.netUsd, d.soldQty);
+        }
+      }
+      if (!r) r = await this.liveSell(pos, pos.heldQty ?? pos.qty);
       if (!r) return false;
       px = r.netPrice; // fee-adjusted effective sell price
       realizedLive = r.netUsd - pos.entryPrice * r.soldQty + (pos.bankedPnl ?? 0);
@@ -1164,6 +1391,9 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
     this.halted = false;
     this.weekHalted = false;
     this.weekTargetHit = false;
+    this.ddHalted = false;
+    this.equityPeak = this.settings.startBalance;
+    this.drawdownPct = 0;
     this.dayStartBalance = this.settings.startBalance;
     this.weekStartBalance = this.settings.startBalance;
     this.dayKey = this.timeKeys().day;
@@ -1193,6 +1423,9 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
 
   /** start a fresh set of P&L books (used when crossing between paper and live) */
   switchBooks(balance: number) {
+    this.equityPeak = balance;
+    this.ddHalted = false;
+    this.drawdownPct = 0;
     this.settings.balance = balance;
     this.settings.startBalance = balance;
     this.dayStartBalance = balance;
@@ -1274,7 +1507,7 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
 
   /** replay the active strategy over ~7 days of REAL Coinbase candles with realistic fees and judge it */
   async runValidation(): Promise<ValidationRecord> {
-    const feeRate = 0.006;
+    const feeRate = feeModel().taker;
     const r = await runBacktest({ scope: "majors", bars: 10000, useLiveBrain: false, startBalance: 1000, feeRate }, null);
     const eq = r.equityCurve.map((p) => p.eq);
     const mid = eq[Math.floor(eq.length / 2)] ?? r.startBalance;
@@ -1313,6 +1546,11 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       entriesLocked: this.liveEntriesLocked,
       bankroll: this.settings.mode === "live" ? this.settings.balance : null,
       openLive: this.positions.filter((p) => p.live).length,
+      protectedLive: this.positions.filter((p) => p.live && p.exOrderId).length,
+      exchangeStops: exchangeStopsOn(),
+      drawdownPct: this.drawdownPct,
+      ddHalted: this.ddHalted,
+      maxDrawdownPct: MAX_DRAWDOWN_PCT,
       feed: this.universe.find((u) => u.market === "majors")?.source ?? "none yet",
       diag: this.liveDiag,
       gate: this.brain.scoreThreshold,
@@ -1505,8 +1743,10 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       startedAt: this.startedAt,
       now: Date.now(),
       uptimeMs: Date.now() - this.startedAt,
-      phase: this.halted ? "HALTED" : this.targetHit ? "BOOKED" : this.phase,
-      phaseDetail: this.halted
+      phase: this.halted || this.ddHalted ? "HALTED" : this.targetHit ? "BOOKED" : this.phase,
+      phaseDetail: this.ddHalted
+        ? `drawdown breaker: equity fell ${this.drawdownPct.toFixed(1)}% from its peak — resume manually after review`
+        : this.halted
         ? `daily loss cap — resume manually after review`
         : this.targetHit
           ? `daily target booked ${fmtUsd(this.dayPnl)} — auto-resumes next UTC day`

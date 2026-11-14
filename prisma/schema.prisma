@@ -17,6 +17,8 @@ model Setting {
   balance          Float    @default(1000)
   paperBalance     Float    @default(1000)  // paper balance parked while mode = live
   validationJson   String   @default("")    // last live-trading validation record (see engine.runValidation)
+  equityPeak       Float    @default(0)     // drawdown breaker: highest equity of the current book
+  ddHalted         Boolean  @default(false) // drawdown breaker tripped — manual resume
   maxPositionPct   Float    @default(8)
   stopLossPct      Float    @default(8)
   tp1Pct           Float    @default(8)
@@ -76,6 +78,7 @@ model Trade {
   featuresJson  String   @default("{}") // analyst sub-scores snapshot
   mode          String   @default("paper") // paper | live (real Coinbase order)
   heldQty       Float    @default(0)       // live: coins actually still held (after TP1 partial sell)
+  exOrderId     String   @default("")      // live: resting Coinbase bracket (stop + take-profit) protecting this position
   openedAt      DateTime @default(now())
   closedAt      DateTime?
 }
@@ -108,4 +111,30 @@ model DeskState {
   id        String   @id @default("main")
   json      String   @default("{}")
   updatedAt DateTime @updatedAt
+}
+
+// Every real order, recorded BEFORE it is sent (so a crash mid-request can be reconciled at boot)
+model Order {
+  id            String   @id @default(cuid())
+  clientOrderId String   @unique
+  exchangeId    String   @default("")
+  tradeId       String   @default("")
+  productId     String
+  side          String // BUY | SELL
+  kind          String // market | bracket
+  purpose       String // entry | tp1 | exit | protect
+  status        String // INTENT | OPEN | FILLED | CANCELLED | REJECTED | UNKNOWN
+  baseSize      Float    @default(0)
+  quoteSize     Float    @default(0)
+  stopPrice     Float    @default(0)
+  limitPrice    Float    @default(0)
+  filledSize    Float    @default(0)
+  filledValue   Float    @default(0)
+  fees          Float    @default(0)
+  error         String   @default("")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([status])
+  @@index([tradeId])
 }

@@ -97,6 +97,10 @@ export interface Position {
   live?: boolean;
   heldQty?: number; // coins actually still held
   bankedPnl?: number; // real P&L already banked by the TP1 partial sell
+  exOrderId?: string; // resting Coinbase bracket (stop + take-profit) protecting this position
+  exStop?: number; // stop trigger currently resting on Coinbase
+  exCheckedAt?: number;
+  exRearmAt?: number;
 }
 
 export type AgentId =

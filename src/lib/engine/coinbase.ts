@@ -322,9 +322,9 @@ async function recoverByClientId(clientId: string, productId: string): Promise<C
 export async function cbMarketOrder(
   productId: string,
   side: "BUY" | "SELL",
-  size: { quoteUsd: number; quoteInc: string } | { baseQty: number; baseInc: string }
+  size: { quoteUsd: number; quoteInc: string } | { baseQty: number; baseInc: string },
+  clientId: string = crypto.randomUUID() // pass one in to record the intent BEFORE the request goes out
 ): Promise<CbFill> {
-  const clientId = crypto.randomUUID();
   const config =
     "quoteUsd" in size
       ? { quote_size: floorTo(size.quoteUsd, size.quoteInc) }
@@ -352,4 +352,90 @@ export async function cbMarketOrder(
     throw new CbError(`order rejected: ${er?.message || er?.error_details || er?.error || "unknown"}`);
   }
   return awaitFill(res.success_response.order_id);
+}
+
+// ───────────── resting exchange-side protection (bracket), cancel, status ─────────────
+
+type CreateResp = {
+  success?: boolean;
+  success_response?: { order_id: string };
+  error_response?: { error?: string; message?: string; error_details?: string };
+};
+
+/** SELL bracket that RESTS on Coinbase: a take-profit limit + a stop trigger (Coinbase places a stop-limit
+ *  5% below the trigger when it fires). It protects the position even if this app is down.
+ *  While it rests, the coins are on hold — cancel it before any app-side sell. */
+export async function cbBracketSell(
+  productId: string,
+  baseQty: number,
+  inc: { baseInc: string; quoteInc: string },
+  takeProfit: number,
+  stopTrigger: number,
+  clientId: string = crypto.randomUUID()
+): Promise<string> {
+  const res = await request<CreateResp>("POST", "/api/v3/brokerage/orders", {
+    auth: true,
+    timeoutMs: 10_000,
+    body: {
+      client_order_id: clientId,
+      product_id: productId,
+      side: "SELL",
+      order_configuration: {
+        trigger_bracket_gtc: {
+          base_size: floorTo(baseQty, inc.baseInc),
+          limit_price: floorTo(takeProfit, inc.quoteInc),
+          stop_trigger_price: floorTo(stopTrigger, inc.quoteInc),
+        },
+      },
+    },
+  });
+  if (!res.success || !res.success_response?.order_id) {
+    const er = res.error_response;
+    throw new CbError(`bracket rejected: ${er?.message || er?.error_details || er?.error || "unknown"}`);
+  }
+  return res.success_response.order_id;
+}
+
+export interface CbOrderState { status: string; fill: CbFill }
+
+export async function cbOrderStatus(orderId: string): Promise<CbOrderState | null> {
+  const res = await request<{ order?: RawOrder }>("GET", `/api/v3/brokerage/orders/historical/${orderId}`, { auth: true });
+  return res.order ? { status: res.order.status, fill: toFill(res.order) } : null;
+}
+
+/** cancel resting orders; returns the ids Coinbase confirmed as cancelled */
+export async function cbCancel(orderIds: string[]): Promise<string[]> {
+  if (orderIds.length === 0) return [];
+  const res = await request<{ results?: { success?: boolean; order_id?: string; failure_reason?: string }[] }>(
+    "POST",
+    "/api/v3/brokerage/orders/batch_cancel",
+    { auth: true, body: { order_ids: orderIds } }
+  );
+  return (res.results ?? []).filter((r) => r.success && r.order_id).map((r) => r.order_id as string);
+}
+
+/** find an order by the client id we generated (used by boot reconciliation) */
+export async function cbFindByClientId(clientId: string, productId: string): Promise<{ orderId: string; status: string; fill: CbFill } | null> {
+  try {
+    const res = await request<{ orders?: RawOrder[] }>("GET", "/api/v3/brokerage/orders/historical/batch", {
+      auth: true,
+      query: `product_ids=${productId}&limit=50`,
+    });
+    const o = (res.orders ?? []).find((x) => x.client_order_id === clientId);
+    return o ? { orderId: o.order_id, status: o.status, fill: toFill(o) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** the account's real fee tier (maker/taker rates) */
+export async function cbFeeTier(): Promise<{ maker: number; taker: number; tier: string; volume30d: number } | null> {
+  const r = await request<{
+    fee_tier?: { pricing_tier?: string; maker_fee_rate?: string; taker_fee_rate?: string };
+    advanced_trade_only_volume?: number;
+  }>("GET", "/api/v3/brokerage/transaction_summary", { auth: true, query: "product_type=SPOT" });
+  const maker = parseFloat(r.fee_tier?.maker_fee_rate ?? "");
+  const taker = parseFloat(r.fee_tier?.taker_fee_rate ?? "");
+  if (!isFinite(maker) || !isFinite(taker) || taker <= 0) return null;
+  return { maker, taker, tier: r.fee_tier?.pricing_tier ?? "unknown", volume30d: r.advanced_trade_only_volume ?? 0 };
 }
