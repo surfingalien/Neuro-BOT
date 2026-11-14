@@ -40,6 +40,7 @@ const MAX_DRAWDOWN_PCT = (() => {
   const v = parseFloat(process.env.MAX_DRAWDOWN_PCT ?? "");
   return isFinite(v) && v > 0 ? v : 10;
 })();
+type FunnelKind = "checked" | "killed" | "scored" | "noTrigger" | "fee" | "locked" | "entered";
 const exchangeStopsOn = () => process.env.LIVE_EXCHANGE_STOPS !== "false";
 const ENGINE_VERSION = 10; // bump to force engine rebuild on code change (dev HMR)
 
@@ -142,11 +143,58 @@ class Engine {
   ddHalted = false;
   drawdownPct = 0;
   balanceCheckAt = 0;
+  funnel: { t: number; k: FunnelKind; score?: number }[] = []; // entry funnel events (last hour) — "why no trades?"
   mismatchLoggedAt = new Map<string, number>();
   validation: ValidationRecord | null = null; // last real-data, after-fees check of the active strategy
   liveDiag = { lastSkip: "", lastSkipAt: 0, lastError: "", lastErrorAt: 0, buys: 0, sells: 0, lastOrderAt: 0 };
 
   /** why a live entry was NOT placed — logged at most once per reason per 5 minutes so the log stays readable */
+  funnelNote(k: FunnelKind, score?: number) {
+    const now = Date.now();
+    this.funnel.push({ t: now, k, score });
+    if (this.funnel.length > 4000 || this.funnel[0].t < now - 3_600_000) this.funnel = this.funnel.filter((e) => e.t >= now - 3_600_000).slice(-3000);
+  }
+
+  /** last hour of the entry pipeline: how many candidates reached each stage, and what is stopping entries */
+  funnelSummary() {
+    const since = Date.now() - 3_600_000;
+    const ev = this.funnel.filter((e) => e.t >= since);
+    const n = (k: FunnelKind) => ev.filter((e) => e.k === k).length;
+    const scores = ev.filter((e) => e.k === "scored").map((e) => e.score ?? 0);
+    const gate = this.brain.scoreThreshold;
+    const out = {
+      minutes: Math.min(60, Math.round((Date.now() - (this.funnel[0]?.t ?? Date.now())) / 60_000)),
+      checked: n("checked"),
+      killed: n("killed"),
+      scored: scores.length,
+      bestScore: scores.length ? Math.max(...scores) : null,
+      gate,
+      passedGate: scores.filter((x) => x >= gate).length,
+      noTrigger: n("noTrigger"),
+      feeSkipped: n("fee"),
+      locked: n("locked"),
+      entered: n("entered"),
+      blockedBy: "",
+    };
+    const live = this.settings.mode === "live";
+    out.blockedBy =
+      this.ddHalted ? "drawdown breaker is on — press RESUME after review"
+      : this.halted ? "daily loss cap hit — press RESUME after review"
+      : this.weekHalted ? "weekly loss cap hit"
+      : this.targetHit || this.weekTargetHit ? "profit target booked for the period"
+      : !this.settings.running ? "bot is paused"
+      : live && this.liveEntriesLocked ? "live entries locked after a restart — type ENABLE LIVE again"
+      : this.positions.length >= this.settings.maxPositions ? "max open positions reached"
+      : out.entered > 0 ? ""
+      : out.checked === 0 ? "nothing scanned yet"
+      : out.scored === 0 ? "no candidate passed the market filter"
+      : out.passedGate === 0 ? `no setup scored ${gate}+ (best ${out.bestScore}) — the market is not giving the signal it waits for`
+      : out.feeSkipped >= out.passedGate - out.noTrigger && out.feeSkipped > 0 ? "every qualifying setup had a stop inside the fee cost (fee guard)"
+      : out.noTrigger > 0 ? "setups scored high but no strategy trigger fired"
+      : "";
+    return out;
+  }
+
   liveSkip(reason: string) {
     const now = Date.now();
     if (this.liveDiag.lastSkip === reason && now - this.liveDiag.lastSkipAt < 300_000) return;
@@ -653,6 +701,7 @@ balance ${fmtUsd(this.settings.balance)}`);
         this.filterProgress = null;
         if (!res.passed) {
           this.killed += 1;
+          this.funnelNote("killed");
           const bad = res.rules[res.failedRuleIndex];
           this.log("KILL", `${fp.pair.base} ${bad.label} — ${bad.value} · killed`);
           this.filterView = { ...this.filterView, checkLine: `${fp.pair.base} killed · rule ${res.failedRuleIndex + 1}/8` };
@@ -676,6 +725,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     const cand = this.queue.shift();
     if (!cand) return;
     this.seen += 1;
+    this.funnelNote("checked");
     this.filterProgress = { pair: cand, revealed: 0, rules: runFilter(cand).rules };
     this.phase = "FILTERING";
     this.phaseDetail = `FILTER picked up ${cand.base}`;
@@ -689,6 +739,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     // research engine: learned signal weights decide what the score means
     const res = runAnalyst(pair, k, threshold, this.brain.signalWeights);
     this.scored += 1;
+    this.funnelNote("scored", res.final);
     const handoff = res.passed
       ? `${res.final} ≥ ${threshold} → handoff to EXECUTOR`
       : `${res.final} < ${threshold} → dropped`;
@@ -708,6 +759,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     const decision = pickStrategy(this.regime, this.brain.weights, this.settings.mode !== "live");
     const sig = checkEntrySignal(decision.strategy, k);
     if (!sig.ok) {
+      this.funnelNote("noTrigger");
       this.log("INFO", `${pair.base} ${decision.strategy} signal not ready · ${sig.detail}`);
       this.analystView = { ...this.analystView, deciding: false, handoff: `${res.final} passed · no ${decision.strategy} trigger` };
       return;
@@ -730,6 +782,7 @@ balance ${fmtUsd(this.settings.balance)}`);
     const live = this.settings.mode === "live";
     if (live) {
       // real money: only Coinbase-listed majors priced from the real Coinbase feed, never simulated data
+      if (this.liveEntriesLocked) this.funnelNote("locked");
       if (this.liveEntriesLocked) return this.liveSkip("new entries are locked after a restart · re-confirm with ENABLE LIVE in the Coinbase panel");
       if (pair.market !== "majors") return;
       if (pair.source !== "coinbase") return this.liveSkip(`price feed is "${pair.source}", not Coinbase · real orders need the real Coinbase feed`);
@@ -757,6 +810,7 @@ balance ${fmtUsd(this.settings.balance)}`);
       const roundTrip = 2 * feeSide + 2 * slip;
       const stopDist = (entry - t0.stopLoss) / entry;
       if (stopDist < roundTrip && process.env.FEE_GUARD !== "false") {
+        this.funnelNote("fee");
         const why = `${pair.base}: stop ${(stopDist * 100).toFixed(2)}% is inside the ${(roundTrip * 100).toFixed(2)}% round-trip cost — fee-dominated, skipped`;
         if (live) return this.liveSkip(why);
         if (this.tickN % 20 === 0) this.log("INFO", why);
@@ -825,6 +879,7 @@ balance ${fmtUsd(this.settings.balance)}`);
       // live: the coins are already bought — never lose track of them
       this.log("RISK", `LIVE ${pair.base} bought (order ${liveOrderId}) but DB write failed · tracking in memory only`);
     }
+    this.funnelNote("entered");
     try {
       this.positions.push({
         id: row?.id ?? `mem-${liveOrderId}`,
@@ -1551,6 +1606,7 @@ day ${this.dayPnl >= 0 ? "+" : "–"}$${Math.abs(this.dayPnl).toFixed(2)} · wee
       drawdownPct: this.drawdownPct,
       ddHalted: this.ddHalted,
       maxDrawdownPct: MAX_DRAWDOWN_PCT,
+      funnel: this.funnelSummary(),
       feed: this.universe.find((u) => u.market === "majors")?.source ?? "none yet",
       diag: this.liveDiag,
       gate: this.brain.scoreThreshold,
