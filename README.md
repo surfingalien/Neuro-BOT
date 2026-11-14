@@ -19,8 +19,6 @@ backtest mode that trains the AI Brain on historical candles in seconds.
 **Coinbase panel, live mode**: fee tier from the account, the "why no trades?" entry funnel, stops resting on Coinbase,
 drawdown vs. limit. *(Captured against a local mock exchange: the balance and key shown are test values.)*
 
-![Coinbase panel with entry funnel and live status](docs/screenshots/coinbase-panel.png)
-
 **Autonomous research desk**: daily walk-forward on real candles, forward tests, promotion/demotion journal.
 
 ![Autonomous desk](docs/screenshots/desk.png)
